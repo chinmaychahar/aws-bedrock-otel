@@ -1,6 +1,11 @@
 # aws-bedrock-otel
 
-OpenTelemetry instrumentation for the [Amazon Bedrock Runtime](https://docs.rs/aws-sdk-bedrockruntime) client of the AWS SDK for Rust, following the OpenTelemetry [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai).
+[![Crates.io](https://img.shields.io/crates/v/aws-bedrock-otel.svg)](https://crates.io/crates/aws-bedrock-otel)
+[![Docs.rs](https://docs.rs/aws-bedrock-otel/badge.svg)](https://docs.rs/aws-bedrock-otel)
+[![CI](https://github.com/chinmaychahar/aws-bedrock-otel/actions/workflows/ci.yml/badge.svg)](https://github.com/chinmaychahar/aws-bedrock-otel/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/aws-bedrock-otel.svg)](LICENSE)
+
+OpenTelemetry tracing for Rust apps that use the official [`aws-sdk-bedrockruntime`](https://docs.rs/aws-sdk-bedrockruntime) client. Add one interceptor and every Bedrock call becomes a span following the OpenTelemetry [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai).
 
 > **Status:** early development. Only non-streaming `Converse` calls are traced for now.
 
