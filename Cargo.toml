@@ -1,0 +1,13 @@
+[package]
+name = "aws-bedrock-otel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "OpenTelemetry GenAI instrumentation for the AWS SDK for Rust Bedrock Runtime client"
+license = "Apache-2.0"
+repository = "https://github.com/chinmaychahar/aws-bedrock-otel"
+readme = "README.md"
+keywords = ["opentelemetry", "aws", "bedrock", "genai", "tracing"]
+categories = ["development-tools::debugging", "development-tools::profiling"]
+
+[dependencies]
