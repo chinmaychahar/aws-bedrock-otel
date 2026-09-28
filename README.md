@@ -7,7 +7,7 @@
 
 OpenTelemetry tracing for Rust apps that use the official [`aws-sdk-bedrockruntime`](https://docs.rs/aws-sdk-bedrockruntime) client. Add one interceptor and your Bedrock calls are traced as spans following the OpenTelemetry [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai).
 
-> **Status:** early development. `Converse` and `ConverseStream` calls are traced; `InvokeModel` is not yet.
+> **Status:** early development. `Converse` and `ConverseStream` calls are traced, `InvokeModel` is WIP
 
 ## Usage
 
@@ -23,9 +23,11 @@ let config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
 let client = aws_sdk_bedrockruntime::Client::from_conf(config);
 ```
 
-`BedrockInterceptor::new()` uses the global tracer provider. Use `BedrockInterceptor::with_tracer_provider(&provider)` to pass one explicitly.
+Notes:
+- `BedrockInterceptor::new()` uses the global tracer provider. Use `BedrockInterceptor::with_tracer_provider(&provider)` to pass one explicitly
+- A `ConverseStream` span ends when the response stream is read to the end or dropped
+- Each `Converse` and `ConverseStream` call records a `chat {model}` span with these attributes
 
-Each `Converse` and `ConverseStream` call records a `chat {model}` span with these attributes. A `ConverseStream` span ends when the response stream is read to the end or dropped.
 
 | Attribute | Source |
 |---|---|
@@ -52,8 +54,8 @@ BEDROCK_MODEL_ID=amazon.nova-lite-v1:0 cargo run --example stdout
 
 ## Minimum supported Rust version
 
-Rust 1.94.1, the same as the AWS SDK for Rust.
+Rust 1.94.1, the same as the AWS SDK for Rust
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Apache License, Version 2.0](LICENSE)
