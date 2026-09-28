@@ -7,7 +7,7 @@
 
 OpenTelemetry tracing for Rust apps that use the official [`aws-sdk-bedrockruntime`](https://docs.rs/aws-sdk-bedrockruntime) client. Add one interceptor and your Bedrock calls are traced as spans following the OpenTelemetry [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai).
 
-> **Status:** early development. Only non-streaming `Converse` calls are traced for now.
+> **Status:** early development. `Converse` and `ConverseStream` calls are traced; `InvokeModel` is not yet.
 
 ## Usage
 
@@ -25,7 +25,7 @@ let client = aws_sdk_bedrockruntime::Client::from_conf(config);
 
 `BedrockInterceptor::new()` uses the global tracer provider. Use `BedrockInterceptor::with_tracer_provider(&provider)` to pass one explicitly.
 
-Each `Converse` call records a `chat {model}` span with these attributes:
+Each `Converse` and `ConverseStream` call records a `chat {model}` span with these attributes. A `ConverseStream` span ends when the response stream is read to the end or dropped.
 
 | Attribute | Source |
 |---|---|
@@ -34,11 +34,13 @@ Each `Converse` call records a `chat {model}` span with these attributes:
 | `gen_ai.request.model` | model ID |
 | `gen_ai.request.max_tokens`, `gen_ai.request.temperature`, `gen_ai.request.top_p`, `gen_ai.request.stop_sequences` | inference configuration, when set |
 | `aws.bedrock.guardrail.id` | guardrail configuration, when set |
+| `gen_ai.request.stream` | `true` for `ConverseStream` |
 | `gen_ai.response.finish_reasons` | stop reason |
+| `gen_ai.response.time_to_first_chunk` | seconds until the first streamed text, for `ConverseStream` |
 | `gen_ai.usage.input_tokens` | input tokens, including cache reads and writes |
 | `gen_ai.usage.output_tokens` | output tokens |
 | `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | cached tokens, when reported |
-| `error.type` | error code, when the call fails |
+| `error.type` | error code, when the call or the stream fails |
 
 ## Examples
 

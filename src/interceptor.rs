@@ -1,22 +1,33 @@
-use std::borrow::Cow;
+use std::time::Instant;
 
 use aws_sdk_bedrockruntime::config::interceptors::{
-    BeforeSerializationInterceptorContextRef, FinalizerInterceptorContextRef,
+    BeforeDeserializationInterceptorContextMut, BeforeSerializationInterceptorContextRef,
+    FinalizerInterceptorContextRef,
 };
 use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_bedrockruntime::error::{BoxError, ProvideErrorMetadata};
 use aws_sdk_bedrockruntime::operation::converse::{ConverseError, ConverseInput, ConverseOutput};
+use aws_sdk_bedrockruntime::operation::converse_stream::{
+    ConverseStreamError, ConverseStreamInput, ConverseStreamOutput,
+};
+use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use opentelemetry::global::{self, BoxedTracer};
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
-use opentelemetry::{Array, Context, InstrumentationScope, KeyValue, StringValue, Value};
+use opentelemetry::{Context, InstrumentationScope, KeyValue};
 
 use crate::attributes::*;
+use crate::stream::TracedBody;
 
 const SCOPE_NAME: &str = env!("CARGO_PKG_NAME");
 const SCOPE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Records an OpenTelemetry span for each `Converse` call made by a Bedrock Runtime client.
+/// Records an OpenTelemetry span for each `Converse` and `ConverseStream` call made by a
+/// Bedrock Runtime client.
+///
+/// Spans follow the OpenTelemetry GenAI semantic conventions and are named `chat {model}`.
+/// A `ConverseStream` span ends when the response stream is read to the end or dropped.
+/// Other operations are not traced yet.
 ///
 /// # Examples
 ///
@@ -71,9 +82,13 @@ fn scope() -> InstrumentationScope {
 
 /// The span of the current call, kept in the request's config bag.
 #[derive(Debug)]
-struct SpanContext(Context);
+struct SpanState {
+    context: Context,
+    started: Instant,
+    streaming: bool,
+}
 
-impl Storable for SpanContext {
+impl Storable for SpanState {
     type Storer = StoreReplace<Self>;
 }
 
@@ -88,20 +103,54 @@ impl Intercept for BedrockInterceptor {
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         // The typed input is only available before serialization.
-        let Some(input) = context.input().downcast_ref::<ConverseInput>() else {
+        let input = context.input();
+        let (model, attributes, streaming) = if let Some(input) =
+            input.downcast_ref::<ConverseInput>()
+        {
+            let guardrail = input.guardrail_config().map(|g| g.guardrail_identifier());
+            let attributes =
+                request_attributes(input.model_id(), input.inference_config(), guardrail, false);
+            (input.model_id(), attributes, false)
+        } else if let Some(input) = input.downcast_ref::<ConverseStreamInput>() {
+            let guardrail = input.guardrail_config().map(|g| g.guardrail_identifier());
+            let attributes =
+                request_attributes(input.model_id(), input.inference_config(), guardrail, true);
+            (input.model_id(), attributes, true)
+        } else {
             return Ok(());
         };
 
-        let model = input.model_id().unwrap_or_default();
         let span = self
             .tracer
-            .span_builder(format!("{OPERATION_CHAT} {model}"))
+            .span_builder(format!("{OPERATION_CHAT} {}", model.unwrap_or_default()))
             .with_kind(SpanKind::Client)
-            .with_attributes(request_attributes(input))
+            .with_attributes(attributes)
             .start(&self.tracer);
 
-        let span_context = Context::current().with_span(span);
-        cfg.interceptor_state().store_put(SpanContext(span_context));
+        cfg.interceptor_state().store_put(SpanState {
+            context: Context::current().with_span(span),
+            started: Instant::now(),
+            streaming,
+        });
+        Ok(())
+    }
+
+    fn modify_before_deserialization(
+        &self,
+        context: &mut BeforeDeserializationInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let Some(state) = cfg.load::<SpanState>() else {
+            return Ok(());
+        };
+        // Error responses aren't event streams; `read_after_execution` handles them.
+        if !state.streaming || !context.response().status().is_success() {
+            return Ok(());
+        }
+        let body = std::mem::replace(context.response_mut().body_mut(), SdkBody::taken());
+        let traced = TracedBody::new(body, state.context.clone(), state.started);
+        *context.response_mut().body_mut() = SdkBody::from_body_1_x(traced);
         Ok(())
     }
 
@@ -111,23 +160,40 @@ impl Intercept for BedrockInterceptor {
         _runtime_components: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        let Some(SpanContext(span_context)) = cfg.load::<SpanContext>() else {
+        let Some(state) = cfg.load::<SpanState>() else {
             return Ok(());
         };
-        let span = span_context.span();
+        let span = state.context.span();
 
         match context.output_or_error() {
             Some(Ok(output)) => {
+                if output.downcast_ref::<ConverseStreamOutput>().is_some() {
+                    // The response stream ends the span.
+                    return Ok(());
+                }
                 if let Some(output) = output.downcast_ref::<ConverseOutput>() {
-                    span.set_attributes(response_attributes(output));
+                    span.set_attribute(finish_reasons(output.stop_reason().as_str()));
+                    if let Some(usage) = output.usage() {
+                        span.set_attributes(usage_attributes(
+                            i64::from(usage.input_tokens()),
+                            i64::from(usage.output_tokens()),
+                            usage.cache_read_input_tokens().map(i64::from),
+                            usage.cache_write_input_tokens().map(i64::from),
+                        ));
+                    }
                 }
             }
             Some(Err(error)) => {
+                let error = error.as_operation_error();
                 let error_type = error
-                    .as_operation_error()
-                    .and_then(|error| error.downcast_ref::<ConverseError>())
-                    .and_then(|error| error.code())
-                    .unwrap_or("_OTHER")
+                    .and_then(|e| e.downcast_ref::<ConverseError>())
+                    .and_then(|e| e.code())
+                    .or_else(|| {
+                        error
+                            .and_then(|e| e.downcast_ref::<ConverseStreamError>())
+                            .and_then(|e| e.code())
+                    })
+                    .unwrap_or(ERROR_TYPE_OTHER)
                     .to_owned();
                 span.set_attribute(KeyValue::new(ERROR_TYPE, error_type.clone()));
                 span.set_status(Status::error(error_type));
@@ -137,84 +203,4 @@ impl Intercept for BedrockInterceptor {
         span.end();
         Ok(())
     }
-}
-
-fn request_attributes(input: &ConverseInput) -> Vec<KeyValue> {
-    let mut attributes = vec![
-        KeyValue::new(GEN_AI_OPERATION_NAME, OPERATION_CHAT),
-        KeyValue::new(GEN_AI_PROVIDER_NAME, PROVIDER_AWS_BEDROCK),
-    ];
-    if let Some(model) = input.model_id() {
-        attributes.push(KeyValue::new(GEN_AI_REQUEST_MODEL, model.to_owned()));
-    }
-    if let Some(config) = input.inference_config() {
-        if let Some(max_tokens) = config.max_tokens() {
-            attributes.push(KeyValue::new(
-                GEN_AI_REQUEST_MAX_TOKENS,
-                i64::from(max_tokens),
-            ));
-        }
-        if let Some(temperature) = config.temperature() {
-            attributes.push(KeyValue::new(
-                GEN_AI_REQUEST_TEMPERATURE,
-                f64::from(temperature),
-            ));
-        }
-        if let Some(top_p) = config.top_p() {
-            attributes.push(KeyValue::new(GEN_AI_REQUEST_TOP_P, f64::from(top_p)));
-        }
-        if !config.stop_sequences().is_empty() {
-            attributes.push(KeyValue::new(
-                GEN_AI_REQUEST_STOP_SEQUENCES,
-                string_array(config.stop_sequences()),
-            ));
-        }
-    }
-    if let Some(guardrail) = input.guardrail_config() {
-        attributes.push(KeyValue::new(
-            AWS_BEDROCK_GUARDRAIL_ID,
-            guardrail.guardrail_identifier().to_owned(),
-        ));
-    }
-    attributes
-}
-
-fn response_attributes(output: &ConverseOutput) -> Vec<KeyValue> {
-    let mut attributes = vec![KeyValue::new(
-        GEN_AI_RESPONSE_FINISH_REASONS,
-        string_array(&[output.stop_reason().as_str()]),
-    )];
-    if let Some(usage) = output.usage() {
-        let cache_read = usage.cache_read_input_tokens().unwrap_or(0);
-        let cache_write = usage.cache_write_input_tokens().unwrap_or(0);
-        // Bedrock excludes cached tokens from `input_tokens`; the convention includes them.
-        let input_tokens =
-            i64::from(usage.input_tokens()) + i64::from(cache_read) + i64::from(cache_write);
-        attributes.push(KeyValue::new(GEN_AI_USAGE_INPUT_TOKENS, input_tokens));
-        attributes.push(KeyValue::new(
-            GEN_AI_USAGE_OUTPUT_TOKENS,
-            i64::from(usage.output_tokens()),
-        ));
-        if let Some(tokens) = usage.cache_read_input_tokens() {
-            attributes.push(KeyValue::new(
-                GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
-                i64::from(tokens),
-            ));
-        }
-        if let Some(tokens) = usage.cache_write_input_tokens() {
-            attributes.push(KeyValue::new(
-                GEN_AI_USAGE_CACHE_WRITE_INPUT_TOKENS,
-                i64::from(tokens),
-            ));
-        }
-    }
-    attributes
-}
-
-fn string_array<S: AsRef<str>>(values: &[S]) -> Value {
-    let values = values
-        .iter()
-        .map(|value| StringValue::from(Cow::Owned(value.as_ref().to_owned())))
-        .collect();
-    Value::Array(Array::String(values))
 }
