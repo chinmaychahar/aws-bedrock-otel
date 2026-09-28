@@ -20,5 +20,6 @@ opentelemetry = { version = "0.33.0", default-features = false, features = ["tra
 aws-config = "1.12.0"
 aws-sdk-bedrockruntime = { version = "1.147.0", features = ["test-util"] }
 aws-smithy-mocks = "0.3.0"
+opentelemetry-stdout = { version = "0.33.0", features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.0", features = ["testing", "trace"] }
 tokio = { version = "1.53.1", features = ["macros", "rt"] }

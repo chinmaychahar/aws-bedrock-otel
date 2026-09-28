@@ -16,7 +16,7 @@ Add `BedrockInterceptor` to your Bedrock Runtime client:
 ```rust
 use aws_bedrock_otel::BedrockInterceptor;
 
-let sdk_config = aws_config::load_from_env().await;
+let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
 let config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
     .interceptor(BedrockInterceptor::new())
     .build();
@@ -39,6 +39,14 @@ Each `Converse` call records a `chat {model}` span with these attributes:
 | `gen_ai.usage.output_tokens` | output tokens |
 | `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | cached tokens, when reported |
 | `error.type` | error code, when the call fails |
+
+## Examples
+
+[`examples/stdout.rs`](examples/stdout.rs) sends one `Converse` request and prints the span to your terminal. It needs AWS credentials and access to the model:
+
+```sh
+BEDROCK_MODEL_ID=amazon.nova-lite-v1:0 cargo run --example stdout
+```
 
 ## Minimum supported Rust version
 

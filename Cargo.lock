@@ -43,6 +43,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "opentelemetry",
+ "opentelemetry-stdout",
  "opentelemetry_sdk",
  "tokio",
 ]
@@ -1502,6 +1503,17 @@ dependencies = [
  "pin-project-lite",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "opentelemetry-stdout"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f71803f481d3f5ccbe477edb42a78f473613712b2327835911a9ea0ab069824"
+dependencies = [
+ "chrono",
+ "opentelemetry",
+ "opentelemetry_sdk",
 ]
 
 [[package]]

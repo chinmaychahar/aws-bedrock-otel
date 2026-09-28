@@ -24,7 +24,7 @@ const SCOPE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// use aws_bedrock_otel::BedrockInterceptor;
 ///
 /// # async fn example() {
-/// let sdk_config = aws_config::load_from_env().await;
+/// let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
 /// let config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
 ///     .interceptor(BedrockInterceptor::new())
 ///     .build();
