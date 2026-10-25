@@ -26,6 +26,7 @@ pub(crate) struct Metrics {
     usage_output: Counter<u64>,
     usage_cache_read: Counter<u64>,
     usage_cache_write: Counter<u64>,
+    tool_duration: Histogram<f64>,
 }
 
 impl Metrics {
@@ -91,6 +92,10 @@ impl Metrics {
                 "gen_ai.client.inference.usage.cache_write.input_tokens",
                 "Input tokens written to the cache.",
             ),
+            tool_duration: seconds(
+                "gen_ai.execute_tool.duration",
+                "The duration of a single tool execution.",
+            ),
         }
     }
 
@@ -129,6 +134,11 @@ impl Metrics {
                 counter.add(non_negative(tokens), &with_modality);
             }
         }
+    }
+
+    pub(crate) fn record_tool_call(&self, attributes: &[KeyValue], duration: Duration) {
+        self.tool_duration
+            .record(duration.as_secs_f64(), attributes);
     }
 
     pub(crate) fn record_time_to_first_chunk(&self, attributes: &[KeyValue], elapsed: Duration) {

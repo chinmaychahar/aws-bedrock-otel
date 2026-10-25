@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use aws_sdk_bedrockruntime::types::{
     AudioSource, CitationGeneratedContent, ContentBlock, ConversationRole, DocumentContentBlock,
     DocumentFormat, DocumentSource, GuardrailConverseContentBlock, ImageSource, Message,
-    ReasoningContentBlock, SystemContentBlock, Tool, ToolConfiguration, ToolResultContentBlock,
-    VideoSource,
+    ReasoningContentBlock, SystemContentBlock, Tool, ToolConfiguration, ToolResultBlock,
+    ToolResultContentBlock, VideoSource,
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::{Map, Value as Json, json};
@@ -148,23 +148,11 @@ impl ContentCapture {
                 "name": tool_use.name(),
                 "arguments": self.json(document_to_json(tool_use.input())),
             }),
-            ContentBlock::ToolResult(result) => {
-                let mut responses: Vec<Json> = result
-                    .content()
-                    .iter()
-                    .filter_map(|content| self.tool_result(content))
-                    .collect();
-                let response = if responses.len() == 1 {
-                    responses.remove(0)
-                } else {
-                    Json::Array(responses)
-                };
-                json!({
-                    "type": "tool_call_response",
-                    "id": result.tool_use_id(),
-                    "response": response,
-                })
-            }
+            ContentBlock::ToolResult(result) => json!({
+                "type": "tool_call_response",
+                "id": result.tool_use_id(),
+                "response": self.tool_response(result),
+            }),
             ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(reasoning)) => {
                 json!({ "type": "reasoning", "content": self.text(reasoning.text()) })
             }
@@ -184,6 +172,50 @@ impl ContentCapture {
             }
             _ => return None,
         })
+    }
+
+    /// The content of a tool result: a single value, or an array if there are several.
+    fn tool_response(&self, result: &ToolResultBlock) -> Json {
+        let mut responses: Vec<Json> = result
+            .content()
+            .iter()
+            .filter_map(|content| self.tool_result(content))
+            .collect();
+        if responses.len() == 1 {
+            responses.remove(0)
+        } else {
+            Json::Array(responses)
+        }
+    }
+
+    /// `gen_ai.tool.call.arguments`.
+    pub(crate) fn tool_call_arguments(&self, input: &Document) -> String {
+        self.json(document_to_json(input)).to_string()
+    }
+
+    /// `gen_ai.tool.call.result`, or `None` if the result is empty. A text result that holds a
+    /// JSON object is recorded as that object. Other text is a JSON string, and several blocks
+    /// are an array.
+    pub(crate) fn tool_call_result(&self, result: &ToolResultBlock) -> Option<String> {
+        // Checked before cutting, so a result cut to nothing is still recorded.
+        let empty = result.content().iter().all(|content| match content {
+            ToolResultContentBlock::Text(text) => text.is_empty(),
+            content => self.tool_result(content).is_none(),
+        });
+        if empty {
+            return None;
+        }
+        let object = match result.content() {
+            [ToolResultContentBlock::Text(text)] => serde_json::from_str::<Json>(text)
+                .ok()
+                .filter(Json::is_object),
+            _ => None,
+        };
+        let value = match object {
+            Some(object) => self.json(object),
+            None => self.tool_response(result),
+        };
+        Some(value.to_string())
     }
 
     fn tool_result(&self, content: &ToolResultContentBlock) -> Option<Json> {

@@ -70,3 +70,33 @@ async fn chat_span_stays_in_the_trace_with_sdk_debug_spans() {
         request.span_context.trace_id()
     );
 }
+
+#[tokio::test]
+async fn tracing_spans_created_in_a_tool_call_are_its_children() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("app")));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let tools = BedrockInterceptor::with_tracer_provider(&provider).tool_tracer();
+
+    async {
+        let call = tools.tool("lookup").start();
+        call.in_context(async {
+            tracing::info_span!("inside").in_scope(|| {});
+        })
+        .await;
+        call.end();
+    }
+    .instrument(tracing::info_span!("request"))
+    .await;
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let request = find(&spans, "request");
+    let tool = find(&spans, "execute_tool lookup");
+    let inside = find(&spans, "inside");
+    assert_eq!(tool.parent_span_id, request.span_context.span_id());
+    assert_eq!(inside.parent_span_id, tool.span_context.span_id());
+}

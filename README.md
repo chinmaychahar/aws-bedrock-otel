@@ -30,7 +30,7 @@ Notes:
 - A `ConverseStream` call ends when the response stream is read to the end or dropped. A stream dropped before `messageStop`, or a call dropped before it finishes (for example by `tokio::time::timeout`), is recorded with `error.type` set to `cancelled`
 - Bedrock sends token usage in the last stream event, after `messageStop`. Read the stream to the end to record it
 - Streams are timed as the caller reads them, so a slow reader adds to the durations. Chunks that arrive together are recorded close together
-- Each `Converse` and `ConverseStream` call records a `chat {model}` span with the attributes below
+- Each `Converse` and `ConverseStream` call records a `chat {model}` span with the attributes below. Tool calls that the app runs can be recorded too, see [Tool calls](#tool-calls)
 
 ### With `tracing`
 
@@ -108,6 +108,32 @@ let interceptor = BedrockInterceptor::new()
     .with_content_capture(true)
     .with_max_content_length(16 * 1024);
 ```
+
+### Tool calls
+
+When the model asks for a tool, the app runs it. `tool_tracer()` returns a `ToolTracer` that records each of those calls as an `execute_tool {tool}` span and in the `gen_ai.execute_tool.duration` histogram. It uses the interceptor's providers and options, so call it after setting them:
+
+```rust
+use aws_bedrock_otel::BedrockInterceptor;
+use aws_sdk_bedrockruntime::types::ContentBlock;
+
+let interceptor = BedrockInterceptor::new();
+let tools = interceptor.tool_tracer();
+// Add `interceptor` to the client, then for each tool call in a response:
+for block in message.content() {
+    if let ContentBlock::ToolUse(tool_use) = block {
+        let call = tools.tool_use(tool_use).start();
+        let result = call.in_context(run_tool(tool_use)).await; // a `ToolResultBlock`
+        call.end_with_result(&result);
+    }
+}
+```
+
+- `tool_use()` records the tool's name, `gen_ai.tool.call.id` and `gen_ai.tool.type` set to `function`. For other tools, use `tools.tool(name)` and set what applies: `.call_id()`, `.tool_type()`, `.description()`, `.agent_name()`, `.conversation_id()` and `.arguments()`
+- End a call with `.end_with_result(&result)`, `.end()` without a result, or `.fail(error_type)`. A result with the status `error` is recorded with `error.type` set to `_OTHER`; use `.fail()` for another error type. A call dropped before it ends is recorded with `error.type` set to `cancelled`, or `_OTHER` if a panic in the tool drops it
+- With content capture on, the arguments and the result of successful calls are recorded as `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result`. The conventions expect JSON objects. A JSON result, or a text result that holds a JSON object, is recorded as that object. Other text is recorded as a JSON string, and several blocks as an array. Empty results aren't recorded
+- Spans start as children of the current context. `call.in_context(future)` and `call.attach()` make spans started by the tool children of its call. In async code, use `in_context`. This includes `tracing` spans, as long as they are created inside, not before: `call.in_context(work.instrument(span))` creates `span` first, so it isn't a child. `tracing` spans rely on the layer's context activation, as in [With `tracing`](#with-tracing)
+- The metric has `gen_ai.tool.name`, and `gen_ai.tool.type`, `gen_ai.agent.name` and `error.type` when set. Its value is the span's duration
 
 ## Examples
 

@@ -32,6 +32,7 @@ use crate::call::Call;
 use crate::content::{ContentCapture, tool_definitions};
 use crate::metrics::Metrics;
 use crate::stream::TracedBody;
+use crate::tool::ToolTracer;
 
 const SCOPE_NAME: &str = env!("CARGO_PKG_NAME");
 const SCOPE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -70,7 +71,7 @@ const CAPTURE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CO
 /// ```
 #[derive(Debug)]
 pub struct BedrockInterceptor {
-    tracer: BoxedTracer,
+    tracer: Arc<BoxedTracer>,
     metrics: Metrics,
     spans: bool,
     record_metrics: bool,
@@ -82,7 +83,7 @@ impl BedrockInterceptor {
     /// Creates an interceptor that uses the global tracer and meter providers.
     pub fn new() -> Self {
         Self {
-            tracer: global::tracer_with_scope(scope()),
+            tracer: Arc::new(global::tracer_with_scope(scope())),
             metrics: Metrics::new(&global::meter_with_scope(scope())),
             spans: true,
             record_metrics: true,
@@ -100,7 +101,9 @@ impl BedrockInterceptor {
         <P::Tracer as Tracer>::Span: Send + Sync + 'static,
     {
         Self {
-            tracer: BoxedTracer::new(Box::new(provider.tracer_with_scope(scope()))),
+            tracer: Arc::new(BoxedTracer::new(Box::new(
+                provider.tracer_with_scope(scope()),
+            ))),
             ..Self::new()
         }
     }
@@ -141,6 +144,19 @@ impl BedrockInterceptor {
     pub fn with_max_content_length(mut self, bytes: usize) -> Self {
         self.max_content_length = Some(bytes);
         self
+    }
+
+    /// Returns a [`ToolTracer`] that records the app's tool calls with this interceptor's
+    /// providers and options. Set the options first.
+    pub fn tool_tracer(&self) -> ToolTracer {
+        ToolTracer::new(
+            self.tracer.clone(),
+            self.record_metrics.then(|| self.metrics.clone()),
+            self.spans,
+            self.capture_content.then_some(ContentCapture {
+                max_length: self.max_content_length,
+            }),
+        )
     }
 }
 
@@ -290,7 +306,7 @@ impl Intercept for BedrockInterceptor {
                 ))
                 .with_kind(SpanKind::Client)
                 .with_attributes(attributes)
-                .start(&self.tracer);
+                .start(self.tracer.as_ref());
             // Content is only captured for spans that are recorded.
             if self.capture_content && span.is_recording() {
                 let content = ContentCapture {

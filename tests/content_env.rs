@@ -50,6 +50,22 @@ async fn captures(configure: fn(BedrockInterceptor) -> BedrockInterceptor) -> bo
         .any(|kv| kv.key.as_str() == "gen_ai.input.messages")
 }
 
+/// Whether a tool call records `gen_ai.tool.call.arguments`.
+fn tool_tracer_captures() -> bool {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let tools = BedrockInterceptor::with_tracer_provider(&provider).tool_tracer();
+    let arguments = aws_smithy_types::Document::Object(Default::default());
+    tools.tool("lookup").arguments(&arguments).start().end();
+    let spans = exporter.get_finished_spans().unwrap();
+    spans[0]
+        .attributes
+        .iter()
+        .any(|kv| kv.key.as_str() == "gen_ai.tool.call.arguments")
+}
+
 fn set_env(value: Option<&str>) {
     // SAFETY: this binary has a single test, so no other thread reads the environment.
     unsafe {
@@ -67,10 +83,12 @@ async fn environment_variable_turns_capture_on() {
 
     set_env(Some("TRUE"));
     assert!(captures(|i| i).await);
+    assert!(tool_tracer_captures());
     assert!(!captures(|i| i.with_content_capture(false)).await);
 
     set_env(Some("1"));
     assert!(!captures(|i| i).await);
+    assert!(!tool_tracer_captures());
     assert!(captures(|i| i.with_content_capture(true)).await);
 
     set_env(None);
