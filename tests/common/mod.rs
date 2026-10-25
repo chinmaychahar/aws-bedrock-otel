@@ -70,11 +70,33 @@ pub fn exception(name: &str) -> Message {
 
 /// A `ConverseStream` rule that answers with the given events.
 pub fn stream_rule(messages: Vec<Message>) -> Rule {
+    stream_rule_with_trailer(messages, &[])
+}
+
+/// Like [`stream_rule`], with raw bytes after the events.
+pub fn stream_rule_with_trailer(messages: Vec<Message>, trailer: &[u8]) -> Rule {
+    mock!(Client::converse_stream).then_http_response(stream_response(messages, trailer))
+}
+
+/// Like [`stream_rule`], answering every request.
+pub fn repeated_stream_rule(messages: Vec<Message>) -> Rule {
+    mock!(Client::converse_stream)
+        .sequence()
+        .http_response(stream_response(messages, &[]))
+        .repeatedly()
+        .build()
+}
+
+fn stream_response(
+    messages: Vec<Message>,
+    trailer: &[u8],
+) -> impl Fn() -> Response<SdkBody> + Send + Sync + 'static {
     let mut body = Vec::new();
     for message in &messages {
         write_message_to(message, &mut body).unwrap();
     }
-    mock!(Client::converse_stream).then_http_response(move || {
+    body.extend_from_slice(trailer);
+    move || {
         let mut response = Response::new(
             StatusCode::try_from(200).unwrap(),
             SdkBody::from(body.clone()),
@@ -83,7 +105,10 @@ pub fn stream_rule(messages: Vec<Message>) -> Rule {
             .headers_mut()
             .insert("content-type", "application/vnd.amazon.eventstream");
         response
-    })
+            .headers_mut()
+            .insert("x-amzn-requestid", "stream-request-id");
+        response
+    }
 }
 
 /// A complete stream with the same token usage as [`converse_output`].
@@ -160,4 +185,33 @@ pub fn metric_points(
             .collect(),
         other => panic!("unexpected data for {name}: {other:?}"),
     }
+}
+
+pub const CONVERSE_BODY: &str = r#"{"output":{"message":{"role":"assistant","content":[{"text":"Hi"}]}},"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15},"metrics":{"latencyMs":1}}"#;
+
+/// An HTTP response with a JSON body and a request ID header.
+pub fn http_response(
+    status: u16,
+    body: &'static str,
+    request_id_header: &'static str,
+    request_id: &'static str,
+) -> Response<SdkBody> {
+    let mut response = Response::new(StatusCode::try_from(status).unwrap(), SdkBody::from(body));
+    response
+        .headers_mut()
+        .insert("content-type", "application/json");
+    response.headers_mut().insert(request_id_header, request_id);
+    response
+}
+
+/// A `Converse` rule that answers with a real HTTP response, so the SDK deserializes it.
+pub fn converse_http_rule() -> Rule {
+    mock!(Client::converse).then_http_response(|| {
+        http_response(
+            200,
+            CONVERSE_BODY,
+            "x-amzn-requestid",
+            "converse-request-id",
+        )
+    })
 }

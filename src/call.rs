@@ -1,13 +1,14 @@
 //! A single traced call.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use opentelemetry::trace::{SpanRef, Status, TraceContextExt};
 use opentelemetry::{Context, KeyValue};
 
 use crate::attributes::{
-    ERROR_TYPE, FINISH_REASON_ERROR, TokenUsage, finish_reasons, usage_attributes,
+    AWS_REQUEST_ID, ERROR_TYPE, FINISH_REASON_ERROR, TokenUsage, finish_reasons, usage_attributes,
 };
 use crate::metrics::Metrics;
 
@@ -19,6 +20,9 @@ pub(crate) struct Call {
     started: Instant,
     metrics: Option<Metrics>,
     metric_attributes: Vec<KeyValue>,
+    /// `metric_attributes` plus the server attributes, once the endpoint is known.
+    full_metric_attributes: OnceLock<Vec<KeyValue>>,
+    request_id: Mutex<Option<String>>,
     stream_delivered: AtomicBool,
     request_done: AtomicBool,
     finished: AtomicBool,
@@ -35,6 +39,8 @@ impl Call {
             started: Instant::now(),
             metrics,
             metric_attributes,
+            full_metric_attributes: OnceLock::new(),
+            request_id: Mutex::new(None),
             stream_delivered: AtomicBool::new(false),
             request_done: AtomicBool::new(false),
             finished: AtomicBool::new(false),
@@ -47,6 +53,32 @@ impl Call {
 
     pub(crate) fn started(&self) -> Instant {
         self.started
+    }
+
+    /// Records the endpoint of the first attempt on the span and metrics.
+    pub(crate) fn set_server(&self, attributes: Vec<KeyValue>) {
+        if attributes.is_empty() || self.full_metric_attributes.get().is_some() {
+            return;
+        }
+        let mut full = self.metric_attributes.clone();
+        full.extend(attributes.iter().cloned());
+        if self.full_metric_attributes.set(full).is_ok() {
+            self.context.span().set_attributes(attributes);
+        }
+    }
+
+    /// Keeps the request ID of the latest attempt that got a response.
+    pub(crate) fn set_request_id(&self, request_id: String) {
+        *self
+            .request_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(request_id);
+    }
+
+    fn metric_attributes(&self) -> &[KeyValue] {
+        self.full_metric_attributes
+            .get()
+            .map_or(&self.metric_attributes, Vec::as_slice)
     }
 
     /// Marks the response stream as handed to the caller. From then on the stream ends the call.
@@ -69,13 +101,13 @@ impl Call {
 
     pub(crate) fn record_time_to_first_chunk(&self, elapsed: Duration) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_time_to_first_chunk(&self.metric_attributes, elapsed);
+            metrics.record_time_to_first_chunk(self.metric_attributes(), elapsed);
         }
     }
 
     pub(crate) fn record_time_per_output_chunk(&self, elapsed: Duration) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_time_per_output_chunk(&self.metric_attributes, elapsed);
+            metrics.record_time_per_output_chunk(self.metric_attributes(), elapsed);
         }
     }
 
@@ -92,6 +124,14 @@ impl Call {
             return;
         }
         let span = self.context.span();
+        let request_id = self
+            .request_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(request_id) = request_id {
+            span.set_attribute(KeyValue::new(AWS_REQUEST_ID, request_id));
+        }
         let finish_reason = finish_reason.or(error_type.map(|_| FINISH_REASON_ERROR));
         if let Some(reason) = finish_reason {
             span.set_attribute(finish_reasons(reason));
@@ -105,7 +145,7 @@ impl Call {
         }
         if let Some(metrics) = &self.metrics {
             metrics.record_call(
-                &self.metric_attributes,
+                self.metric_attributes(),
                 self.started.elapsed(),
                 usage,
                 error_type,

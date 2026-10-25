@@ -26,6 +26,7 @@ let client = aws_sdk_bedrockruntime::Client::from_conf(config);
 Notes:
 - `BedrockInterceptor::new()` uses the global tracer and meter providers. They are read when the interceptor is created, so set them first. Use `BedrockInterceptor::with_tracer_provider(&tracer_provider)` and `.with_meter_provider(&meter_provider)` to pass them explicitly
 - `.without_spans()` records metrics only, for apps where another library (such as Rig) already creates spans for these calls. `.without_metrics()` records spans only
+- Add one `BedrockInterceptor` per client. If there are several, the first one to see a call traces it, and each call is still recorded once. Client-level interceptors see calls before ones added with `customize()`, so a `customize()` interceptor is ignored when the client already has one
 - A `ConverseStream` call ends when the response stream is read to the end or dropped. A stream dropped before `messageStop`, or a call dropped before it finishes (for example by `tokio::time::timeout`), is recorded with `error.type` set to `cancelled`
 - Bedrock sends token usage in the last stream event, after `messageStop`. Read the stream to the end to record it
 - Streams are timed as the caller reads them, so a slow reader adds to the durations. Chunks that arrive together are recorded close together
@@ -33,7 +34,7 @@ Notes:
 
 ### With `tracing`
 
-With [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) 0.34 (the release for `opentelemetry` 0.33), spans join the trace of the current `tracing` span. This relies on the layer's `with_context_activation`, which is on by default. If the SDK's own debug spans are enabled, the `chat` span appears under the SDK's `apply_configuration` span.
+With [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) 0.34 (the release for `opentelemetry` 0.33), spans join the trace of the current `tracing` span. This relies on the layer's `with_context_activation`, which is on by default. If the SDK's own debug spans are enabled, the `chat` span appears under one of them instead of directly under your span.
 
 ### Spans
 
@@ -45,6 +46,10 @@ With [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) 0.34 (the 
 | `gen_ai.request.model` | model ID |
 | `gen_ai.request.max_tokens`, `gen_ai.request.temperature`, `gen_ai.request.top_p`, `gen_ai.request.stop_sequences` | inference configuration, when set |
 | `aws.bedrock.guardrail.id` | guardrail configuration, when set |
+| `gen_ai.output.type` | `json` when a JSON schema output format is requested |
+| `gen_ai.request.reasoning.level` | output configuration `effort`, when set. Reasoning set in `additionalModelRequestFields` is not recorded |
+| `server.address`, `server.port` | endpoint the request is sent to. Added after the span starts, so samplers don't see them |
+| `aws.request_id` | AWS request ID of the latest attempt that got a response (an AWS SDK attribute, not a GenAI one) |
 | `gen_ai.request.stream` | `true` for `ConverseStream` |
 | `gen_ai.response.finish_reasons` | stop reason, or `error` when the call fails before one is received |
 | `gen_ai.response.time_to_first_chunk` | seconds until the first content chunk, for `ConverseStream` |
@@ -63,11 +68,11 @@ With [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) 0.34 (the 
 | `gen_ai.client.inference.operation.input_tokens`, `gen_ai.client.inference.operation.output_tokens` | histograms, tokens | for every call; `0` when there is no usage |
 | `gen_ai.client.inference.usage.input_tokens`, `.output_tokens`, `.cache_read.input_tokens`, `.cache_write.input_tokens` | counters, tokens | when the count is above `0` |
 
-Metrics have `gen_ai.operation.name`, `gen_ai.provider.name` and `gen_ai.request.model`. Durations and token histograms also have `error.type` when the call fails, and the usage counters have `gen_ai.token.modality` set to `unknown`.
+Metrics have `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `server.address` and `server.port`. Durations and token histograms also have `error.type` when the call fails, and the usage counters have `gen_ai.token.modality` set to `unknown`.
 
 ### Errors
 
-When the SDK returns an error, `error.type` is the first of these that applies:
+When the interceptor sees the SDK's error, `error.type` is the first of these that applies:
 
 1. the Bedrock error code, such as `ThrottlingException` or `ValidationException`
 2. `timeout`, for SDK attempt timeouts and connection timeouts
@@ -79,7 +84,7 @@ Otherwise:
 - `timeout` when the SDK's operation timeout ends the call
 - `cancelled` when the call is dropped before it returns, or its stream is dropped before `messageStop`
 - the exception name, such as `ModelStreamErrorException`, when Bedrock sends an exception in the stream
-- `_OTHER` when reading the stream fails, or another interceptor fails the call after the stream opened
+- `_OTHER` when reading the stream fails, its framing, message type or event type is invalid, the `messageStop` or `metadata` event can't be parsed, it ends before `messageStop`, or another interceptor fails the call after the stream opened. Other events the SDK can't parse show up as `cancelled` when the caller drops the stream
 
 ## Examples
 

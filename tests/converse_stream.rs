@@ -2,18 +2,27 @@ mod common;
 
 use aws_bedrock_otel::BedrockInterceptor;
 use aws_sdk_bedrockruntime::Client;
+use aws_sdk_bedrockruntime::config::SharedInterceptor;
 use aws_sdk_bedrockruntime::config::interceptors::FinalizerInterceptorContextRef;
 use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_bedrockruntime::error::BoxError;
 use aws_sdk_bedrockruntime::error::ErrorMetadata;
 use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
 use aws_sdk_bedrockruntime::types::error::ValidationException;
+use aws_sdk_bedrockruntime::types::{
+    JsonSchemaDefinition, OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType,
+};
 use aws_smithy_mocks::{Rule, RuleMode, mock, mock_client};
 use opentelemetry::trace::Status;
 use opentelemetry::{Array, StringValue, Value};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 
-use common::{event, exception, full_stream, stream_rule};
+use aws_smithy_eventstream::frame::write_message_to;
+use aws_smithy_runtime_api::http::{Response, StatusCode};
+use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
+use bytes::Bytes;
+use common::{event, exception, full_stream, message, stream_rule, stream_rule_with_trailer};
 
 struct Setup {
     provider: SdkTracerProvider,
@@ -87,6 +96,14 @@ async fn records_span_when_stream_is_read() {
         Some(Value::Bool(true))
     );
     assert_eq!(
+        attribute(span, "aws.request_id"),
+        Some(Value::from("stream-request-id"))
+    );
+    assert_eq!(
+        attribute(span, "server.address"),
+        Some(Value::from("bedrock-runtime.us-east-1.amazonaws.com"))
+    );
+    assert_eq!(
         attribute(span, "gen_ai.response.finish_reasons"),
         Some(Value::Array(Array::String(vec![StringValue::from(
             "end_turn"
@@ -132,6 +149,14 @@ async fn ends_span_when_stream_is_dropped() {
     let spans = setup.spans();
     assert_eq!(spans.len(), 1);
     assert_eq!(attribute(&spans[0], "error.type"), None);
+    for key in ["aws.request_id", "gen_ai.response.time_to_first_chunk"] {
+        let count = spans[0]
+            .attributes
+            .iter()
+            .filter(|kv| kv.key.as_str() == key)
+            .count();
+        assert_eq!(count, 1, "{key}");
+    }
 }
 
 #[tokio::test]
@@ -276,6 +301,46 @@ async fn stream_failed_by_another_interceptor_is_an_error() {
 }
 
 #[tokio::test]
+async fn the_same_instance_twice_has_no_duplicate_attributes() {
+    let setup = Setup::new();
+    let rule = stream_rule(full_stream());
+    let shared = SharedInterceptor::new(BedrockInterceptor::with_tracer_provider(&setup.provider));
+    let client = mock_client!(
+        aws_sdk_bedrockruntime,
+        RuleMode::Sequential,
+        &[&rule],
+        move |config| config
+            .interceptor(shared.clone())
+            .interceptor(shared.clone())
+    );
+
+    let mut output = client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+
+    let spans = setup.spans();
+    assert_eq!(spans.len(), 1);
+    for key in [
+        "aws.request_id",
+        "server.address",
+        "gen_ai.response.finish_reasons",
+        "gen_ai.response.time_to_first_chunk",
+        "gen_ai.usage.input_tokens",
+    ] {
+        let count = spans[0]
+            .attributes
+            .iter()
+            .filter(|kv| kv.key.as_str() == key)
+            .count();
+        assert_eq!(count, 1, "{key}");
+    }
+}
+
+#[tokio::test]
 async fn registering_the_interceptor_twice_records_one_span() {
     let setup = Setup::new();
     let rule = stream_rule(full_stream());
@@ -300,4 +365,151 @@ async fn registering_the_interceptor_twice_records_one_span() {
     let spans = setup.spans();
     assert_eq!(spans.len(), 1);
     assert_eq!(attribute(&spans[0], "error.type"), None);
+}
+
+#[tokio::test]
+async fn records_structured_output_and_reasoning_level() {
+    let setup = Setup::new();
+    let rule = stream_rule(full_stream());
+    let client = setup.client(&rule);
+
+    let schema = JsonSchemaDefinition::builder()
+        .schema(r#"{"type":"object"}"#)
+        .build()
+        .unwrap();
+    let output_config = OutputConfig::builder()
+        .text_format(
+            OutputFormat::builder()
+                .r#type(OutputFormatType::JsonSchema)
+                .structure(OutputFormatStructure::JsonSchema(schema))
+                .build()
+                .unwrap(),
+        )
+        .effort("low")
+        .build();
+    let mut output = client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .output_config(output_config)
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+
+    let spans = setup.spans();
+    assert_eq!(
+        attribute(&spans[0], "gen_ai.output.type"),
+        Some(Value::from("json"))
+    );
+    assert_eq!(
+        attribute(&spans[0], "gen_ai.request.reasoning.level"),
+        Some(Value::from("low"))
+    );
+}
+
+/// A body that sends `bytes` and then fails.
+struct FailingBody {
+    bytes: Option<Bytes>,
+}
+
+impl http_body::Body for FailingBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, std::io::Error>>> {
+        std::task::Poll::Ready(Some(match self.bytes.take() {
+            Some(bytes) => Ok(http_body::Frame::data(bytes)),
+            None => Err(std::io::Error::other("connection reset")),
+        }))
+    }
+}
+
+async fn error_type_after_reading(rule: Rule) -> Option<Value> {
+    let setup = Setup::new();
+    let client = setup.client(&rule);
+    let mut output = client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+    while let Ok(Some(_)) = output.stream.recv().await {}
+    drop(output);
+    let spans = setup.spans();
+    assert_eq!(spans.len(), 1);
+    attribute(&spans[0], "error.type")
+}
+
+#[tokio::test]
+async fn body_errors_are_recorded_as_other() {
+    let mut bytes = Vec::new();
+    write_message_to(
+        &event("messageStart", r#"{"role":"assistant"}"#),
+        &mut bytes,
+    )
+    .unwrap();
+    let rule = mock!(Client::converse_stream).then_http_response(move || {
+        let body = FailingBody {
+            bytes: Some(Bytes::from(bytes.clone())),
+        };
+        Response::new(
+            StatusCode::try_from(200).unwrap(),
+            SdkBody::from_body_1_x(body),
+        )
+    });
+    assert_eq!(
+        error_type_after_reading(rule).await,
+        Some(Value::from("_OTHER"))
+    );
+}
+
+#[tokio::test]
+async fn unknown_message_types_are_recorded_as_other() {
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        message("error", ":error-code", "InternalFailure", "{}"),
+    ]);
+    assert_eq!(
+        error_type_after_reading(rule).await,
+        Some(Value::from("_OTHER"))
+    );
+}
+
+#[tokio::test]
+async fn partial_frames_at_the_end_are_recorded_as_other() {
+    let rule = stream_rule_with_trailer(full_stream(), &[0, 0, 0, 40, 0, 0]);
+    assert_eq!(
+        error_type_after_reading(rule).await,
+        Some(Value::from("_OTHER"))
+    );
+}
+
+#[tokio::test]
+async fn events_without_a_type_are_recorded_as_other() {
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        Message::new(b"{}".to_vec()).add_header(Header::new(
+            ":message-type",
+            HeaderValue::String("event".into()),
+        )),
+    ]);
+    assert_eq!(
+        error_type_after_reading(rule).await,
+        Some(Value::from("_OTHER"))
+    );
+}
+
+#[tokio::test]
+async fn unparseable_message_stop_is_recorded_as_other() {
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        event("messageStop", "not json"),
+    ]);
+    assert_eq!(
+        error_type_after_reading(rule).await,
+        Some(Value::from("_OTHER"))
+    );
 }

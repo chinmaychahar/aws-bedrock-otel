@@ -5,7 +5,10 @@ use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::error::ErrorMetadata;
 use aws_sdk_bedrockruntime::operation::converse::ConverseError;
 use aws_sdk_bedrockruntime::types::error::ValidationException;
-use aws_sdk_bedrockruntime::types::{GuardrailConfiguration, InferenceConfiguration};
+use aws_sdk_bedrockruntime::types::{
+    GuardrailConfiguration, InferenceConfiguration, JsonSchemaDefinition, OutputConfig,
+    OutputFormat, OutputFormatStructure, OutputFormatType,
+};
 use aws_smithy_mocks::{Rule, RuleMode, mock, mock_client};
 use opentelemetry::trace::{
     FutureExt, SpanKind, Status, TraceContextExt, Tracer, TracerProvider as _,
@@ -13,7 +16,11 @@ use opentelemetry::trace::{
 use opentelemetry::{Array, Context, KeyValue, StringValue, Value};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 
-use common::converse_output;
+use aws_sdk_bedrockruntime::config::interceptors::BeforeDeserializationInterceptorContextRef;
+use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
+use aws_sdk_bedrockruntime::error::BoxError;
+use aws_smithy_runtime_api::client::retries::RequestAttempts;
+use common::{CONVERSE_BODY, converse_http_rule, converse_output, http_response};
 
 struct Setup {
     provider: SdkTracerProvider,
@@ -138,6 +145,8 @@ async fn omits_unset_request_settings() {
         "gen_ai.request.top_p",
         "gen_ai.request.stop_sequences",
         "aws.bedrock.guardrail.id",
+        "gen_ai.output.type",
+        "gen_ai.request.reasoning.level",
     ] {
         assert_eq!(attribute(&span, key), None, "{key}");
     }
@@ -201,4 +210,241 @@ async fn uses_current_span_as_parent() {
         .find(|span| span.name == "chat amazon.nova-lite")
         .unwrap();
     assert_eq!(span.parent_span_id, parent_span_id);
+}
+
+#[tokio::test]
+async fn records_server_and_request_id_from_http() {
+    let setup = Setup::new();
+    let rule = converse_http_rule();
+    let client = setup.client(&rule);
+
+    client
+        .converse()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+
+    let span = setup.only_span();
+    assert_eq!(
+        attribute(&span, "server.address"),
+        Some(Value::from("bedrock-runtime.us-east-1.amazonaws.com"))
+    );
+    assert_eq!(attribute(&span, "server.port"), Some(Value::I64(443)));
+    assert_eq!(
+        attribute(&span, "aws.request_id"),
+        Some(Value::from("converse-request-id"))
+    );
+    assert_eq!(
+        attribute(&span, "gen_ai.response.finish_reasons"),
+        Some(strings(&["end_turn"]))
+    );
+    assert_eq!(
+        attribute(&span, "gen_ai.usage.input_tokens"),
+        Some(Value::I64(10))
+    );
+}
+
+#[tokio::test]
+async fn records_structured_output_and_reasoning_level() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse).then_output(converse_output);
+    let client = setup.client(&rule);
+
+    let schema = JsonSchemaDefinition::builder()
+        .schema(r#"{"type":"object"}"#)
+        .build()
+        .unwrap();
+    let output_config = OutputConfig::builder()
+        .text_format(
+            OutputFormat::builder()
+                .r#type(OutputFormatType::JsonSchema)
+                .structure(OutputFormatStructure::JsonSchema(schema))
+                .build()
+                .unwrap(),
+        )
+        .effort("high")
+        .build();
+    client
+        .converse()
+        .model_id("amazon.nova-lite")
+        .output_config(output_config)
+        .send()
+        .await
+        .unwrap();
+
+    let span = setup.only_span();
+    assert_eq!(
+        attribute(&span, "gen_ai.output.type"),
+        Some(Value::from("json"))
+    );
+    assert_eq!(
+        attribute(&span, "gen_ai.request.reasoning.level"),
+        Some(Value::from("high"))
+    );
+}
+
+fn count(span: &SpanData, key: &str) -> usize {
+    span.attributes
+        .iter()
+        .filter(|kv| kv.key.as_str() == key)
+        .count()
+}
+
+#[tokio::test]
+async fn retries_record_the_last_request_id_once() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse)
+        .sequence()
+        .http_response(|| http_response(503, "{}", "x-amzn-requestid", "first"))
+        .times(2)
+        .http_response(|| http_response(200, CONVERSE_BODY, "x-amzn-requestid", "second"))
+        .build();
+    let client = setup.client(&rule);
+
+    client
+        .converse()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+
+    let span = setup.only_span();
+    assert_eq!(rule.num_calls(), 3);
+    assert_eq!(count(&span, "aws.request_id"), 1);
+    assert_eq!(
+        attribute(&span, "aws.request_id"),
+        Some(Value::from("second"))
+    );
+    assert_eq!(count(&span, "server.address"), 1);
+}
+
+#[tokio::test]
+async fn request_id_falls_back_to_x_amz_request_id() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse)
+        .then_http_response(|| http_response(200, CONVERSE_BODY, "x-amz-request-id", "fallback"));
+    let client = setup.client(&rule);
+
+    client
+        .converse()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        attribute(&setup.only_span(), "aws.request_id"),
+        Some(Value::from("fallback"))
+    );
+}
+
+#[tokio::test]
+async fn error_responses_record_the_request_id() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse).then_http_response(|| {
+        let mut response = http_response(
+            400,
+            r#"{"message":"bad"}"#,
+            "x-amzn-requestid",
+            "error-request-id",
+        );
+        response
+            .headers_mut()
+            .insert("x-amzn-errortype", "ValidationException");
+        response
+    });
+    let client = setup.client(&rule);
+
+    client
+        .converse()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap_err();
+
+    let span = setup.only_span();
+    assert_eq!(
+        attribute(&span, "aws.request_id"),
+        Some(Value::from("error-request-id"))
+    );
+    assert_eq!(
+        attribute(&span, "error.type"),
+        Some(Value::from("ValidationException"))
+    );
+}
+
+#[tokio::test]
+async fn request_id_reads_x_amzn_request_id() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse)
+        .then_http_response(|| http_response(200, CONVERSE_BODY, "x-amzn-request-id", "dashed"));
+    let client = setup.client(&rule);
+
+    client
+        .converse()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        attribute(&setup.only_span(), "aws.request_id"),
+        Some(Value::from("dashed"))
+    );
+}
+
+/// Fails the second attempt in `read_after_transmit`.
+#[derive(Debug)]
+struct FailSecondTransmit;
+
+impl Intercept for FailSecondTransmit {
+    fn name(&self) -> &'static str {
+        "FailSecondTransmit"
+    }
+
+    fn read_after_transmit(
+        &self,
+        _context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        match cfg.load::<RequestAttempts>().map(RequestAttempts::attempts) {
+            Some(2) => Err("failed".into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn request_id_is_from_the_latest_response_when_another_interceptor_fails() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse)
+        .sequence()
+        .http_response(|| http_response(503, "{}", "x-amzn-requestid", "first"))
+        .http_response(|| http_response(200, CONVERSE_BODY, "x-amzn-requestid", "second"))
+        .build();
+    let provider = &setup.provider;
+    let client = mock_client!(
+        aws_sdk_bedrockruntime,
+        RuleMode::Sequential,
+        &[&rule],
+        move |config| config
+            .interceptor(BedrockInterceptor::with_tracer_provider(provider))
+            .interceptor(FailSecondTransmit)
+    );
+
+    client
+        .converse()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap_err();
+
+    let span = setup.only_span();
+    assert_eq!(count(&span, "aws.request_id"), 1);
+    assert_eq!(
+        attribute(&span, "aws.request_id"),
+        Some(Value::from("second"))
+    );
 }

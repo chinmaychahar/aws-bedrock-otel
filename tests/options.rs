@@ -90,6 +90,15 @@ async fn without_spans_records_metrics_and_leaves_the_current_span_alone() {
 
     assert!(setup.span_names().is_empty(), "no span is created or ended");
     assert_eq!(setup.duration_count(), 1);
+    let duration = metric_points(&setup.meter_provider, &setup.metric_exporter, DURATION);
+    assert!(
+        duration[0]
+            .attributes
+            .contains(&opentelemetry::KeyValue::new(
+                "server.address",
+                "bedrock-runtime.us-east-1.amazonaws.com"
+            ))
+    );
 
     parent_context.span().end();
     let spans = setup.span_exporter.get_finished_spans().unwrap();

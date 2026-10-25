@@ -3,7 +3,7 @@
 //! Defined here because the `gen_ai.*` constants in `opentelemetry-semantic-conventions` are
 //! deprecated.
 
-use aws_sdk_bedrockruntime::types::InferenceConfiguration;
+use aws_sdk_bedrockruntime::types::{InferenceConfiguration, OutputConfig, OutputFormatType};
 use opentelemetry::{Array, KeyValue, StringValue, Value};
 
 pub(crate) const GEN_AI_OPERATION_NAME: &str = "gen_ai.operation.name";
@@ -14,6 +14,8 @@ pub(crate) const GEN_AI_REQUEST_TEMPERATURE: &str = "gen_ai.request.temperature"
 pub(crate) const GEN_AI_REQUEST_TOP_P: &str = "gen_ai.request.top_p";
 pub(crate) const GEN_AI_REQUEST_STOP_SEQUENCES: &str = "gen_ai.request.stop_sequences";
 pub(crate) const GEN_AI_REQUEST_STREAM: &str = "gen_ai.request.stream";
+pub(crate) const GEN_AI_REQUEST_REASONING_LEVEL: &str = "gen_ai.request.reasoning.level";
+pub(crate) const GEN_AI_OUTPUT_TYPE: &str = "gen_ai.output.type";
 pub(crate) const GEN_AI_RESPONSE_FINISH_REASONS: &str = "gen_ai.response.finish_reasons";
 pub(crate) const GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK: &str = "gen_ai.response.time_to_first_chunk";
 pub(crate) const GEN_AI_USAGE_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
@@ -25,9 +27,13 @@ pub(crate) const GEN_AI_USAGE_CACHE_WRITE_INPUT_TOKENS: &str =
 pub(crate) const GEN_AI_TOKEN_MODALITY: &str = "gen_ai.token.modality";
 pub(crate) const AWS_BEDROCK_GUARDRAIL_ID: &str = "aws.bedrock.guardrail.id";
 pub(crate) const ERROR_TYPE: &str = "error.type";
+pub(crate) const SERVER_ADDRESS: &str = "server.address";
+pub(crate) const SERVER_PORT: &str = "server.port";
+pub(crate) const AWS_REQUEST_ID: &str = "aws.request_id";
 
 pub(crate) const PROVIDER_AWS_BEDROCK: &str = "aws.bedrock";
 pub(crate) const OPERATION_CHAT: &str = "chat";
+pub(crate) const OUTPUT_TYPE_JSON: &str = "json";
 pub(crate) const ERROR_TYPE_OTHER: &str = "_OTHER";
 pub(crate) const ERROR_TYPE_TIMEOUT: &str = "timeout";
 pub(crate) const ERROR_TYPE_CANCELLED: &str = "cancelled";
@@ -38,6 +44,7 @@ pub(crate) const TOKEN_MODALITY_UNKNOWN: &str = "unknown";
 pub(crate) fn request_attributes(
     model: Option<&str>,
     config: Option<&InferenceConfiguration>,
+    output_config: Option<&OutputConfig>,
     guardrail_id: Option<&str>,
     stream: bool,
 ) -> Vec<KeyValue> {
@@ -68,6 +75,20 @@ pub(crate) fn request_attributes(
             attributes.push(KeyValue::new(
                 GEN_AI_REQUEST_STOP_SEQUENCES,
                 string_array(config.stop_sequences()),
+            ));
+        }
+    }
+    if let Some(output_config) = output_config {
+        let json = output_config
+            .text_format()
+            .is_some_and(|format| *format.r#type() == OutputFormatType::JsonSchema);
+        if json {
+            attributes.push(KeyValue::new(GEN_AI_OUTPUT_TYPE, OUTPUT_TYPE_JSON));
+        }
+        if let Some(effort) = output_config.effort() {
+            attributes.push(KeyValue::new(
+                GEN_AI_REQUEST_REASONING_LEVEL,
+                effort.to_owned(),
             ));
         }
     }
@@ -128,6 +149,28 @@ pub(crate) fn metric_attributes(model: Option<&str>) -> Vec<KeyValue> {
     attributes
 }
 
+/// `server.address` and `server.port` of the endpoint a request is sent to.
+pub(crate) fn server_attributes(uri: &str) -> Vec<KeyValue> {
+    let Ok(uri) = uri.parse::<http::Uri>() else {
+        return Vec::new();
+    };
+    let Some(host) = uri.host() else {
+        return Vec::new();
+    };
+    let port = uri.port_u16().or(match uri.scheme_str() {
+        Some("https") => Some(443),
+        Some("http") => Some(80),
+        _ => None,
+    });
+    // IPv6 hosts are written in brackets in URIs, but not in `server.address`.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let mut attributes = vec![KeyValue::new(SERVER_ADDRESS, host.to_owned())];
+    if let Some(port) = port {
+        attributes.push(KeyValue::new(SERVER_PORT, i64::from(port)));
+    }
+    attributes
+}
+
 pub(crate) fn finish_reasons(reason: &str) -> KeyValue {
     KeyValue::new(GEN_AI_RESPONSE_FINISH_REASONS, string_array(&[reason]))
 }
@@ -181,6 +224,24 @@ mod tests {
                 GEN_AI_USAGE_CACHE_WRITE_INPUT_TOKENS
             ]
         );
+    }
+
+    #[test]
+    fn server_attributes_from_uri() {
+        let server = |uri| {
+            server_attributes(uri)
+                .into_iter()
+                .map(|kv| kv.value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            server("https://bedrock-runtime.us-west-2.amazonaws.com/model/m/converse"),
+            ["bedrock-runtime.us-west-2.amazonaws.com", "443"]
+        );
+        assert_eq!(server("http://localhost/model"), ["localhost", "80"]);
+        assert_eq!(server("http://localhost:4566/model"), ["localhost", "4566"]);
+        assert_eq!(server("https://[::1]:8443/model"), ["::1", "8443"]);
+        assert!(server("not a uri").is_empty());
     }
 
     #[test]

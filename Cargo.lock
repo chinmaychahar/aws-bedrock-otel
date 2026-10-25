@@ -44,6 +44,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "bytes",
+ "http 1.5.0",
  "http-body 1.1.0",
  "opentelemetry",
  "opentelemetry-stdout",

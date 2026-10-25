@@ -16,6 +16,7 @@ aws-smithy-eventstream = "0.61.4"
 aws-smithy-runtime-api = { version = "1.18.0", features = ["client"] }
 aws-smithy-types = { version = "1.8.1", features = ["http-body-1-x"] }
 bytes = "1.12.1"
+http = "1"
 http-body = "1"
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics", "trace"] }
 serde = { version = "1.0.229", features = ["derive"] }

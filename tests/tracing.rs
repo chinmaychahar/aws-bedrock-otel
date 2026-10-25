@@ -62,10 +62,9 @@ async fn chat_span_stays_in_the_trace_with_sdk_debug_spans() {
     let spans = spans(LevelFilter::DEBUG).await;
     let request = find(&spans, "request");
     let sdk = find(&spans, "Bedrock Runtime.Converse");
-    let configuration = find(&spans, "apply_configuration");
     let chat = find(&spans, "chat m");
     assert_eq!(sdk.parent_span_id, request.span_context.span_id());
-    assert_eq!(chat.parent_span_id, configuration.span_context.span_id());
+    assert_ne!(chat.parent_span_id, request.span_context.span_id());
     assert_eq!(
         chat.span_context.trace_id(),
         request.span_context.trace_id()

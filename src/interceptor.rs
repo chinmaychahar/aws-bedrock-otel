@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_bedrockruntime::config::interceptors::{
-    BeforeDeserializationInterceptorContextMut, BeforeSerializationInterceptorContextRef,
-    BeforeTransmitInterceptorContextRef, FinalizerInterceptorContextRef,
+    BeforeDeserializationInterceptorContextMut, BeforeDeserializationInterceptorContextRef,
+    BeforeSerializationInterceptorContextRef, BeforeTransmitInterceptorContextRef,
+    FinalizerInterceptorContextRef,
 };
 use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_bedrockruntime::error::{BoxError, ProvideErrorMetadata};
@@ -13,6 +14,7 @@ use aws_sdk_bedrockruntime::operation::converse_stream::{
 };
 use aws_smithy_runtime_api::client::interceptors::context::Error;
 use aws_smithy_runtime_api::client::orchestrator::{HttpResponse, OrchestratorError};
+use aws_smithy_runtime_api::client::retries::RequestAttempts;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use aws_smithy_types::timeout::TimeoutConfig;
@@ -39,7 +41,9 @@ const SCOPE_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// Use [`without_spans`](Self::without_spans) or [`without_metrics`](Self::without_metrics) to
 /// record only one of them. Global providers are read when the interceptor is created, so set
-/// them first.
+/// them first. If a client has more than one `BedrockInterceptor`, the first one to see a call
+/// traces it and the others ignore it. Client-level interceptors see calls before ones added
+/// with `customize()`.
 ///
 /// # Examples
 ///
@@ -126,6 +130,9 @@ struct CallState {
     call: Arc<Call>,
     streaming: bool,
     operation_timeout: Option<Duration>,
+    /// The attempt whose response body was wrapped, so it is wrapped once even if the
+    /// interceptor is registered twice.
+    wrapped_attempt: Option<u32>,
 }
 
 impl Storable for CallState {
@@ -140,6 +147,7 @@ impl Drop for CallState {
         }
         // The SDK's operation timeout drops the request without telling the interceptors.
         // Its timer starts after this call does, so the elapsed time is at least the timeout.
+        // A caller that drops the request after that long is also counted as a timeout.
         let timed_out = self
             .operation_timeout
             .is_some_and(|timeout| self.call.started().elapsed() >= timeout);
@@ -168,13 +176,25 @@ impl Intercept for BedrockInterceptor {
         }
         // The typed input is only available before serialization.
         let input = context.input();
-        let (model, config, guardrail, streaming) =
+        let (model, config, output_config, guardrail, streaming) =
             if let Some(input) = input.downcast_ref::<ConverseInput>() {
                 let guardrail = input.guardrail_config().map(|g| g.guardrail_identifier());
-                (input.model_id(), input.inference_config(), guardrail, false)
+                (
+                    input.model_id(),
+                    input.inference_config(),
+                    input.output_config(),
+                    guardrail,
+                    false,
+                )
             } else if let Some(input) = input.downcast_ref::<ConverseStreamInput>() {
                 let guardrail = input.guardrail_config().map(|g| g.guardrail_identifier());
-                (input.model_id(), input.inference_config(), guardrail, true)
+                (
+                    input.model_id(),
+                    input.inference_config(),
+                    input.output_config(),
+                    guardrail,
+                    true,
+                )
             } else {
                 return Ok(());
             };
@@ -182,7 +202,7 @@ impl Intercept for BedrockInterceptor {
         // Without spans, an empty context makes every span operation a no-op, so the caller's
         // current span is never touched.
         let span_context = if self.spans {
-            let attributes = request_attributes(model, config, guardrail, streaming);
+            let attributes = request_attributes(model, config, output_config, guardrail, streaming);
             let span = self
                 .tracer
                 .span_builder(format!("{OPERATION_CHAT} {}", model.unwrap_or_default()))
@@ -200,13 +220,14 @@ impl Intercept for BedrockInterceptor {
             call: Arc::new(call),
             streaming,
             operation_timeout: None,
+            wrapped_attempt: None,
         });
         Ok(())
     }
 
-    fn read_before_attempt(
+    fn read_before_serialization(
         &self,
-        _context: &BeforeTransmitInterceptorContextRef<'_>,
+        _context: &BeforeSerializationInterceptorContextRef<'_>,
         _runtime_components: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
@@ -219,19 +240,55 @@ impl Intercept for BedrockInterceptor {
         Ok(())
     }
 
+    fn read_before_transmit(
+        &self,
+        context: &BeforeTransmitInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        // The endpoint is resolved for each attempt, so these are added after the span starts.
+        if let Some(state) = cfg.load::<CallState>() {
+            state
+                .call
+                .set_server(server_attributes(context.request().uri()));
+        }
+        Ok(())
+    }
+
+    // The first hook after each response. It runs for every interceptor, so another
+    // interceptor failing doesn't skip it.
+    fn read_after_transmit(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        if let Some(state) = cfg.load::<CallState>()
+            && let Some(request_id) = request_id(context.response())
+        {
+            state.call.set_request_id(request_id.to_owned());
+        }
+        Ok(())
+    }
+
     fn modify_before_deserialization(
         &self,
         context: &mut BeforeDeserializationInterceptorContextMut<'_>,
         _runtime_components: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        let Some(state) = cfg.load::<CallState>() else {
+        let attempt = cfg
+            .load::<RequestAttempts>()
+            .map_or(0, RequestAttempts::attempts);
+        let Some(state) = cfg.get_mut_from_interceptor_state::<CallState>() else {
             return Ok(());
         };
         // Error responses aren't event streams; `read_after_execution` handles them.
-        if !state.streaming || !context.response().status().is_success() {
+        let success = context.response().status().is_success();
+        if !state.streaming || !success || state.wrapped_attempt == Some(attempt) {
             return Ok(());
         }
+        state.wrapped_attempt = Some(attempt);
         let body = std::mem::replace(context.response_mut().body_mut(), SdkBody::taken());
         let traced = TracedBody::new(body, state.call.clone());
         *context.response_mut().body_mut() = SdkBody::from_body_1_x(traced);
@@ -270,6 +327,15 @@ impl Intercept for BedrockInterceptor {
         }
         Ok(())
     }
+}
+
+/// The request ID, from the headers listed for `aws.request_id`.
+fn request_id(response: &HttpResponse) -> Option<&str> {
+    let headers = response.headers();
+    headers
+        .get("x-amzn-requestid")
+        .or_else(|| headers.get("x-amzn-request-id"))
+        .or_else(|| headers.get("x-amz-request-id"))
 }
 
 /// The Bedrock error code, `timeout`, the HTTP status code, or `_OTHER`, in that order.

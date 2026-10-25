@@ -2,6 +2,7 @@ mod common;
 
 use aws_bedrock_otel::BedrockInterceptor;
 use aws_sdk_bedrockruntime::Client;
+use aws_sdk_bedrockruntime::config::SharedInterceptor;
 use aws_sdk_bedrockruntime::config::interceptors::AfterDeserializationInterceptorContextRef;
 use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_bedrockruntime::error::BoxError;
@@ -14,7 +15,10 @@ use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 
-use common::{Point, converse_output, event, exception, full_stream, metric_points, stream_rule};
+use common::{
+    Point, converse_output, event, exception, full_stream, metric_points, repeated_stream_rule,
+    stream_rule, stream_rule_with_trailer,
+};
 
 const DURATION: &str = "gen_ai.client.inference.duration";
 const TIME_TO_FIRST_CHUNK: &str = "gen_ai.client.inference.time_to_first_chunk";
@@ -127,6 +131,8 @@ fn base_attributes() -> Vec<KeyValue> {
         KeyValue::new("gen_ai.operation.name", "chat"),
         KeyValue::new("gen_ai.provider.name", "aws.bedrock"),
         KeyValue::new("gen_ai.request.model", MODEL),
+        KeyValue::new("server.address", "bedrock-runtime.us-east-1.amazonaws.com"),
+        KeyValue::new("server.port", 443),
     ]
 }
 
@@ -468,4 +474,180 @@ async fn stream_dropped_before_its_final_event_is_cancelled() {
     assert_eq!(duration.count, 1);
     assert_attributes(&duration, &cancelled);
     assert_eq!(setup.point(INPUT_TOKENS).sum, 0.0);
+}
+
+#[tokio::test]
+async fn two_interceptors_record_each_call_once() {
+    let setup = Setup::new();
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"a"}}"#,
+        ),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"b"}}"#,
+        ),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"c"}}"#,
+        ),
+        event("messageStop", r#"{"stopReason":"end_turn"}"#),
+    ]);
+    let tracer_provider = &setup.tracer_provider;
+    let meter_provider = &setup.meter_provider;
+    let client = mock_client!(
+        aws_sdk_bedrockruntime,
+        RuleMode::Sequential,
+        &[&rule],
+        move |config| config
+            .interceptor(
+                BedrockInterceptor::with_tracer_provider(tracer_provider)
+                    .with_meter_provider(meter_provider)
+            )
+            .interceptor(
+                BedrockInterceptor::with_tracer_provider(tracer_provider)
+                    .with_meter_provider(meter_provider)
+            )
+    );
+
+    let mut output = client
+        .converse_stream()
+        .model_id(MODEL)
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+
+    assert_chunks_recorded_once(&setup);
+}
+
+#[tokio::test]
+async fn stream_ending_before_message_stop_is_an_error() {
+    let setup = Setup::new();
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"a"}}"#,
+        ),
+    ]);
+    let client = setup.client(&rule);
+
+    let mut output = client
+        .converse_stream()
+        .model_id(MODEL)
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+
+    assert_attributes(
+        &setup.point(DURATION),
+        &with(base_attributes(), KeyValue::new("error.type", "_OTHER")),
+    );
+}
+
+#[tokio::test]
+async fn malformed_stream_frames_are_an_error() {
+    let setup = Setup::new();
+    // A 16-byte frame with wrong checksums.
+    let malformed = [0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let rule = stream_rule_with_trailer(
+        vec![event("messageStart", r#"{"role":"assistant"}"#)],
+        &malformed,
+    );
+    let client = setup.client(&rule);
+
+    let mut output = client
+        .converse_stream()
+        .model_id(MODEL)
+        .send()
+        .await
+        .unwrap();
+    output.stream.recv().await.unwrap();
+    output.stream.recv().await.unwrap_err();
+    drop(output);
+
+    let duration = setup.point(DURATION);
+    assert_eq!(duration.count, 1);
+    assert_attributes(
+        &duration,
+        &with(base_attributes(), KeyValue::new("error.type", "_OTHER")),
+    );
+}
+
+fn three_chunk_stream() -> Vec<aws_smithy_types::event_stream::Message> {
+    vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"a"}}"#,
+        ),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"b"}}"#,
+        ),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"c"}}"#,
+        ),
+        event("messageStop", r#"{"stopReason":"end_turn"}"#),
+    ]
+}
+
+fn assert_chunks_recorded_once(setup: &Setup) {
+    assert_eq!(setup.point(DURATION).count, 1);
+    assert_eq!(setup.point(TIME_TO_FIRST_CHUNK).count, 1);
+    assert_eq!(setup.point(TIME_PER_OUTPUT_CHUNK).count, 2);
+}
+
+#[tokio::test]
+async fn the_same_interceptor_registered_twice_records_once() {
+    let setup = Setup::new();
+    let rule = stream_rule(three_chunk_stream());
+    let shared = SharedInterceptor::new(
+        BedrockInterceptor::with_tracer_provider(&setup.tracer_provider)
+            .with_meter_provider(&setup.meter_provider),
+    );
+    let client = mock_client!(
+        aws_sdk_bedrockruntime,
+        RuleMode::Sequential,
+        &[&rule],
+        move |config| config
+            .interceptor(shared.clone())
+            .interceptor(shared.clone())
+    );
+
+    let mut output = client
+        .converse_stream()
+        .model_id(MODEL)
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+
+    assert_chunks_recorded_once(&setup);
+}
+
+#[tokio::test]
+async fn config_override_with_the_client_config_records_once() {
+    let setup = Setup::new();
+    // The override also copies the mock interceptor, so the mock must answer twice.
+    let rule = repeated_stream_rule(three_chunk_stream());
+    let client = setup.client(&rule);
+
+    // `to_builder` copies the client's interceptors into the override.
+    let mut output = client
+        .converse_stream()
+        .model_id(MODEL)
+        .customize()
+        .config_override(client.config().to_builder())
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+
+    assert_chunks_recorded_once(&setup);
 }

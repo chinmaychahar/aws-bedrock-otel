@@ -60,7 +60,11 @@ impl Body for TracedBody {
                 }
             }
             Poll::Ready(Some(Err(_))) => this.recorder.finish(Some(ERROR_TYPE_OTHER)),
-            Poll::Ready(None) => this.recorder.finish(None),
+            // A stream that ends before `messageStop`, or inside a frame, was cut short.
+            Poll::Ready(None) => {
+                let cut_short = !this.recorder.message_stopped || !this.recorder.buffer.is_empty();
+                this.recorder.finish(cut_short.then_some(ERROR_TYPE_OTHER));
+            }
             Poll::Pending => {}
         }
         poll
@@ -109,12 +113,17 @@ impl Recorder {
         self.buffer.extend_from_slice(data);
         loop {
             match self.decoder.decode_frame(&mut self.buffer) {
-                Ok(DecodedFrame::Complete(message)) => self.handle(&message),
+                Ok(DecodedFrame::Complete(message)) => {
+                    self.handle(&message);
+                    if !self.decoding {
+                        break;
+                    }
+                }
                 Ok(DecodedFrame::Incomplete) => break,
                 Err(_) => {
-                    // Stop decoding malformed frames; the stream itself is unaffected.
-                    self.decoding = false;
+                    // The SDK fails to decode the same frame, so the stream has failed.
                     self.buffer = BytesMut::new();
+                    self.finish(Some(ERROR_TYPE_OTHER));
                     break;
                 }
             }
@@ -127,25 +136,26 @@ impl Recorder {
                 Some("contentBlockDelta") => self.record_chunk(),
                 Some("messageStop") => {
                     self.message_stopped = true;
-                    if let Ok(MessageStop { stop_reason }) =
-                        serde_json::from_slice(message.payload())
-                    {
-                        self.stop_reason = stop_reason;
+                    match serde_json::from_slice::<MessageStop>(message.payload()) {
+                        Ok(MessageStop { stop_reason }) => self.stop_reason = stop_reason,
+                        // The SDK fails on the same payload.
+                        Err(_) => self.finish(Some(ERROR_TYPE_OTHER)),
                     }
                 }
-                Some("metadata") => {
-                    if let Ok(Metadata { usage: Some(usage) }) =
-                        serde_json::from_slice(message.payload())
-                    {
-                        self.usage = Some(TokenUsage {
+                Some("metadata") => match serde_json::from_slice::<Metadata>(message.payload()) {
+                    Ok(Metadata { usage }) => {
+                        self.usage = usage.map(|usage| TokenUsage {
                             input: usage.input_tokens,
                             output: usage.output_tokens,
                             cache_read: usage.cache_read_input_tokens,
                             cache_write: usage.cache_write_input_tokens,
                         });
                     }
-                }
-                _ => {}
+                    Err(_) => self.finish(Some(ERROR_TYPE_OTHER)),
+                },
+                Some(_) => {}
+                // The SDK fails on events without a type.
+                None => self.finish(Some(ERROR_TYPE_OTHER)),
             },
             Some("exception") => {
                 let error_type = header(message, ":exception-type")
@@ -153,7 +163,8 @@ impl Recorder {
                     .unwrap_or_else(|| ERROR_TYPE_OTHER.to_owned());
                 self.finish(Some(&error_type));
             }
-            _ => {}
+            // The SDK fails on any other message type.
+            _ => self.finish(Some(ERROR_TYPE_OTHER)),
         }
     }
 
@@ -178,6 +189,7 @@ impl Recorder {
     /// Ends the call, unless the stream never reached the caller. In that case the request
     /// failed and the interceptor ends the call.
     fn finish(&mut self, error_type: Option<&str>) {
+        self.decoding = false;
         if self.call.is_stream_delivered() {
             self.call
                 .finish(self.usage.as_ref(), self.stop_reason.as_deref(), error_type);

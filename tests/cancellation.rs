@@ -1,4 +1,4 @@
-//! Calls dropped before they finish, for example by a timeout, are recorded as cancelled.
+//! Calls dropped before they finish are recorded as cancelled, and timeouts as timeout.
 
 mod common;
 
@@ -14,10 +14,13 @@ use aws_smithy_runtime_api::client::http::{
 };
 use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_runtime_api::http::{Response, StatusCode};
+use aws_smithy_types::body::SdkBody;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::Status;
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::metric_points;
 
@@ -215,4 +218,65 @@ async fn connection_timeouts_are_recorded_as_timeout() {
         .await
         .unwrap_err();
     setup.assert_error_type("timeout");
+}
+
+/// An HTTP client that answers the first two requests with a 503 and never answers the others.
+#[derive(Debug, Clone, Default)]
+struct FailsThenHangs {
+    calls: std::sync::Arc<AtomicUsize>,
+}
+
+impl HttpConnector for FailsThenHangs {
+    fn call(&self, _request: HttpRequest) -> HttpConnectorFuture {
+        let request_id = match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => "first",
+            1 => "second",
+            _ => return HttpConnectorFuture::new(std::future::pending()),
+        };
+        let mut response = Response::new(StatusCode::try_from(503).unwrap(), SdkBody::from("{}"));
+        response
+            .headers_mut()
+            .insert("x-amzn-requestid", request_id);
+        HttpConnectorFuture::ready(Ok(response))
+    }
+}
+
+impl HttpClient for FailsThenHangs {
+    fn http_connector(
+        &self,
+        _settings: &HttpConnectorSettings,
+        _components: &RuntimeComponents,
+    ) -> SharedHttpConnector {
+        SharedHttpConnector::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn timeouts_keep_the_request_id_of_an_earlier_attempt() {
+    let setup = Setup::with_config(|config| {
+        config
+            .http_client(FailsThenHangs::default())
+            .retry_config(RetryConfig::standard().with_initial_backoff(Duration::from_millis(1)))
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_millis(200))
+                    .build(),
+            )
+    });
+
+    setup
+        .client
+        .converse()
+        .model_id("m")
+        .send()
+        .await
+        .unwrap_err();
+
+    setup.assert_error_type("timeout");
+    let spans = setup.span_exporter.get_finished_spans().unwrap();
+    assert!(
+        spans[0]
+            .attributes
+            .contains(&KeyValue::new("aws.request_id", "second"))
+    );
 }
