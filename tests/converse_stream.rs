@@ -22,7 +22,10 @@ use aws_smithy_runtime_api::http::{Response, StatusCode};
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
 use bytes::Bytes;
-use common::{event, exception, full_stream, message, stream_rule, stream_rule_with_trailer};
+use common::{
+    event, exception, full_stream, http_response, message, stream_response, stream_rule,
+    stream_rule_with_trailer,
+};
 
 struct Setup {
     provider: SdkTracerProvider,
@@ -44,7 +47,7 @@ impl Setup {
             aws_sdk_bedrockruntime,
             RuleMode::Sequential,
             &[rule],
-            move |config| config.interceptor(BedrockInterceptor::with_tracer_provider(provider))
+            move |config| config.interceptor(BedrockInterceptor::new().tracer_provider(provider))
         )
     }
 
@@ -281,7 +284,7 @@ async fn stream_failed_by_another_interceptor_is_an_error() {
         RuleMode::Sequential,
         &[&rule],
         move |config| config
-            .interceptor(BedrockInterceptor::with_tracer_provider(provider))
+            .interceptor(BedrockInterceptor::new().tracer_provider(provider))
             .interceptor(FailAfterExecution)
     );
 
@@ -304,7 +307,7 @@ async fn stream_failed_by_another_interceptor_is_an_error() {
 async fn the_same_instance_twice_has_no_duplicate_attributes() {
     let setup = Setup::new();
     let rule = stream_rule(full_stream());
-    let shared = SharedInterceptor::new(BedrockInterceptor::with_tracer_provider(&setup.provider));
+    let shared = SharedInterceptor::new(BedrockInterceptor::new().tracer_provider(&setup.provider));
     let client = mock_client!(
         aws_sdk_bedrockruntime,
         RuleMode::Sequential,
@@ -350,8 +353,8 @@ async fn registering_the_interceptor_twice_records_one_span() {
         RuleMode::Sequential,
         &[&rule],
         move |config| config
-            .interceptor(BedrockInterceptor::with_tracer_provider(provider))
-            .interceptor(BedrockInterceptor::with_tracer_provider(provider))
+            .interceptor(BedrockInterceptor::new().tracer_provider(provider))
+            .interceptor(BedrockInterceptor::new().tracer_provider(provider))
     );
 
     let mut output = client
@@ -546,4 +549,104 @@ async fn missing_token_counts_are_zero_like_the_sdk() {
         attribute(&spans[0], "gen_ai.usage.output_tokens"),
         Some(Value::I64(0))
     );
+}
+
+#[tokio::test]
+async fn retried_streams_are_recorded_once() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse_stream)
+        .sequence()
+        .http_response(|| http_response(503, "{}", "x-amzn-requestid", "first"))
+        .times(1)
+        .http_response(stream_response(full_stream(), &[]))
+        .build();
+    let client = setup.client(&rule);
+    let mut output = client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+    drop(output);
+
+    assert_eq!(rule.num_calls(), 2);
+    let spans = setup.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(attribute(&spans[0], "error.type"), None);
+    assert_eq!(
+        attribute(&spans[0], "aws.request_id"),
+        Some(Value::from("stream-request-id"))
+    );
+    assert_eq!(
+        attribute(&spans[0], "gen_ai.usage.output_tokens"),
+        Some(Value::I64(5))
+    );
+}
+
+#[tokio::test]
+async fn streams_ending_after_message_stop_succeed_without_usage() {
+    let setup = Setup::new();
+    // The rule sends the whole body at once, so the stream must end at `messageStop`.
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"Hi"}}"#,
+        ),
+        event("messageStop", r#"{"stopReason":"end_turn"}"#),
+    ]);
+    let client = setup.client(&rule);
+    let mut output = client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+    drop(output);
+
+    let spans = setup.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(attribute(&spans[0], "error.type"), None);
+    assert_eq!(attribute(&spans[0], "gen_ai.usage.input_tokens"), None);
+    assert_eq!(
+        attribute(&spans[0], "gen_ai.response.finish_reasons"),
+        Some(strings(&["end_turn"]))
+    );
+}
+
+#[tokio::test]
+async fn sampled_out_streams_without_metrics_still_work() {
+    use opentelemetry_sdk::trace::Sampler;
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOff)
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let rule = stream_rule(full_stream());
+    let client = mock_client!(
+        aws_sdk_bedrockruntime,
+        RuleMode::Sequential,
+        &[&rule],
+        |config| config.interceptor(
+            BedrockInterceptor::new()
+                .tracer_provider(&provider)
+                .metrics(false)
+                .content_capture(true)
+        )
+    );
+    let mut output = client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+    let mut events = 0;
+    while output.stream.recv().await.unwrap().is_some() {
+        events += 1;
+    }
+
+    assert_eq!(events, full_stream().len());
+    assert!(exporter.get_finished_spans().unwrap().is_empty());
 }

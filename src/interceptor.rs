@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use aws_sdk_bedrockruntime::config::interceptors::{
     BeforeDeserializationInterceptorContextMut, BeforeDeserializationInterceptorContextRef,
@@ -29,7 +29,7 @@ use opentelemetry::{Context, InstrumentationScope, KeyValue};
 
 use crate::attributes::*;
 use crate::call::Call;
-use crate::content::{ContentCapture, tool_definitions};
+use crate::content::{ContentCapture, server_tool_names, tool_definitions};
 use crate::metrics::Metrics;
 use crate::stream::TracedBody;
 use crate::tool::ToolTracer;
@@ -47,14 +47,13 @@ const CAPTURE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CO
 /// recorded with `error.type` set to `cancelled`. Other operations are not traced yet.
 ///
 /// Prompts and responses are not recorded unless
-/// [`with_content_capture`](Self::with_content_capture) or the
+/// [`content_capture`](Self::content_capture) or the
 /// `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` environment variable turns it on.
 ///
-/// Use [`without_spans`](Self::without_spans) or [`without_metrics`](Self::without_metrics) to
-/// record only one of them. Global providers are read when the interceptor is created, so set
-/// them first. If a client has more than one `BedrockInterceptor`, the first one to see a call
-/// traces it and the others ignore it. Client-level interceptors see calls before ones added
-/// with `customize()`.
+/// Use [`spans`](Self::spans) or [`metrics`](Self::metrics) to turn either off. Global providers
+/// are read when the interceptor is created, so set them first. If a client has more than one
+/// `BedrockInterceptor`, the first one to see a call traces it and the others ignore it.
+/// Client-level interceptors see calls before ones added with `customize()`.
 ///
 /// # Examples
 ///
@@ -65,6 +64,26 @@ const CAPTURE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CO
 /// let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
 /// let config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
 ///     .interceptor(BedrockInterceptor::new())
+///     .build();
+/// let client = aws_sdk_bedrockruntime::Client::from_conf(config);
+/// # }
+/// ```
+///
+/// With explicit providers:
+///
+/// ```no_run
+/// use aws_bedrock_otel::BedrockInterceptor;
+///
+/// # fn example(
+/// #     tracer_provider: &opentelemetry_sdk::trace::SdkTracerProvider,
+/// #     meter_provider: &opentelemetry_sdk::metrics::SdkMeterProvider,
+/// #     sdk_config: &aws_config::SdkConfig,
+/// # ) {
+/// let interceptor = BedrockInterceptor::new()
+///     .tracer_provider(tracer_provider)
+///     .meter_provider(meter_provider);
+/// let config = aws_sdk_bedrockruntime::config::Builder::from(sdk_config)
+///     .interceptor(interceptor)
 ///     .build();
 /// let client = aws_sdk_bedrockruntime::Client::from_conf(config);
 /// # }
@@ -81,6 +100,7 @@ pub struct BedrockInterceptor {
 
 impl BedrockInterceptor {
     /// Creates an interceptor that uses the global tracer and meter providers.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             tracer: Arc::new(global::tracer_with_scope(scope())),
@@ -93,47 +113,50 @@ impl BedrockInterceptor {
         }
     }
 
-    /// Creates an interceptor that uses the given tracer provider and the global meter provider.
-    pub fn with_tracer_provider<P>(provider: &P) -> Self
+    /// Records spans with the given tracer provider instead of the global one.
+    #[must_use]
+    pub fn tracer_provider<P>(mut self, provider: &P) -> Self
     where
         P: TracerProvider,
         P::Tracer: Send + Sync + 'static,
         <P::Tracer as Tracer>::Span: Send + Sync + 'static,
     {
-        Self {
-            tracer: Arc::new(BoxedTracer::new(Box::new(
-                provider.tracer_with_scope(scope()),
-            ))),
-            ..Self::new()
-        }
+        self.tracer = Arc::new(BoxedTracer::new(Box::new(
+            provider.tracer_with_scope(scope()),
+        )));
+        self
     }
 
     /// Records metrics with the given meter provider instead of the global one.
-    pub fn with_meter_provider<P: MeterProvider>(mut self, provider: &P) -> Self {
+    #[must_use]
+    pub fn meter_provider<P: MeterProvider>(mut self, provider: &P) -> Self {
         self.metrics = Metrics::new(&provider.meter_with_scope(scope()));
         self
     }
 
-    /// Records metrics only. Use this when another library, such as Rig, already creates spans
-    /// for these calls.
-    pub fn without_spans(mut self) -> Self {
-        self.spans = false;
+    /// Whether to record spans. On by default. Turn them off when another library, such as
+    /// Rig, already creates spans for these calls.
+    #[must_use]
+    pub fn spans(mut self, enabled: bool) -> Self {
+        self.spans = enabled;
         self
     }
 
-    /// Records spans only. This takes precedence over
-    /// [`with_meter_provider`](Self::with_meter_provider).
-    pub fn without_metrics(mut self) -> Self {
-        self.record_metrics = false;
+    /// Whether to record metrics. On by default.
+    #[must_use]
+    pub fn metrics(mut self, enabled: bool) -> Self {
+        self.record_metrics = enabled;
         self
     }
 
-    /// Records prompts, responses, system instructions and tool names on spans. This overrides
-    /// the `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` environment variable.
+    /// Whether to record prompts, responses, system instructions and tool definitions on chat
+    /// spans, and tool call arguments and results on [`ToolTracer`] spans. This overrides the
+    /// `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` environment variable.
     ///
     /// Content may include personal or sensitive data. Media sent as bytes is recorded
     /// without the bytes.
-    pub fn with_content_capture(mut self, enabled: bool) -> Self {
+    #[must_use]
+    pub fn content_capture(mut self, enabled: bool) -> Self {
         self.capture_content = enabled;
         self
     }
@@ -141,13 +164,15 @@ impl BedrockInterceptor {
     /// Cuts each captured text, tool call argument and JSON tool result to at most `bytes` bytes.
     /// Cut JSON values are recorded as strings. The X-Ray OTLP endpoint rejects spans larger
     /// than 200 KB.
-    pub fn with_max_content_length(mut self, bytes: usize) -> Self {
+    #[must_use]
+    pub fn max_content_length(mut self, bytes: usize) -> Self {
         self.max_content_length = Some(bytes);
         self
     }
 
     /// Returns a [`ToolTracer`] that records the app's tool calls with this interceptor's
     /// providers and options. Set the options first.
+    #[must_use]
     pub fn tool_tracer(&self) -> ToolTracer {
         ToolTracer::new(
             self.tracer.clone(),
@@ -273,7 +298,8 @@ impl Intercept for BedrockInterceptor {
         context: &BeforeSerializationInterceptorContextRef<'_>,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        // Another `BedrockInterceptor` on the same client already traces this call.
+        // Nothing to record, or another `BedrockInterceptor` on the client already traces this
+        // call.
         if (!self.spans && !self.record_metrics) || cfg.load::<CallState>().is_some() {
             return Ok(());
         }
@@ -290,6 +316,7 @@ impl Intercept for BedrockInterceptor {
 
         // Without spans, an empty context makes every span operation a no-op, so the caller's
         // current span is never touched.
+        let started = (Instant::now(), SystemTime::now());
         let span_context = if self.spans {
             let attributes = request_attributes(
                 request.model,
@@ -300,11 +327,9 @@ impl Intercept for BedrockInterceptor {
             );
             let mut span = self
                 .tracer
-                .span_builder(format!(
-                    "{OPERATION_CHAT} {}",
-                    request.model.unwrap_or_default()
-                ))
+                .span_builder(span_name(request.model))
                 .with_kind(SpanKind::Client)
+                .with_start_time(started.1)
                 .with_attributes(attributes)
                 .start(self.tracer.as_ref());
             // Content is only captured for spans that are recorded.
@@ -313,7 +338,7 @@ impl Intercept for BedrockInterceptor {
                     max_length: self.max_content_length,
                 };
                 span.set_attributes(request.content_attributes(&content));
-                capture = Some(content);
+                capture = Some((content, server_tool_names(request.messages)));
             }
             Context::current().with_span(span)
         } else {
@@ -323,6 +348,7 @@ impl Intercept for BedrockInterceptor {
         let metrics = self.record_metrics.then(|| self.metrics.clone());
         let call = Call::new(
             span_context,
+            started,
             metrics,
             capture,
             metric_attributes(request.model),
@@ -394,9 +420,14 @@ impl Intercept for BedrockInterceptor {
         let Some(state) = cfg.get_mut_from_interceptor_state::<CallState>() else {
             return Ok(());
         };
-        // Error responses aren't event streams; `read_after_execution` handles them.
+        // Error responses aren't event streams; `read_after_execution` handles them. Streams
+        // of calls that record nothing aren't decoded.
         let success = context.response().status().is_success();
-        if !state.streaming || !success || state.wrapped_attempt == Some(attempt) {
+        if !state.streaming
+            || !success
+            || state.wrapped_attempt == Some(attempt)
+            || !state.call.is_recorded()
+        {
             return Ok(());
         }
         state.wrapped_attempt = Some(attempt);
@@ -423,7 +454,9 @@ impl Intercept for BedrockInterceptor {
                     call.deliver_stream();
                 } else if let Some(output) = output.downcast_ref::<ConverseOutput>() {
                     if let Some(ConverseResult::Message(message)) = output.output() {
-                        call.set_output(|capture| Some(capture.output_messages(message)));
+                        call.set_output(|capture, earlier| {
+                            Some(capture.output_messages(message, earlier))
+                        });
                     }
                     let usage = output.usage().map(|usage| TokenUsage {
                         input: i64::from(usage.input_tokens()),
@@ -440,6 +473,13 @@ impl Intercept for BedrockInterceptor {
             None => {}
         }
         Ok(())
+    }
+}
+
+fn span_name(model: Option<&str>) -> String {
+    match model {
+        Some(model) if !model.is_empty() => format!("{OPERATION_CHAT} {model}"),
+        _ => OPERATION_CHAT.to_owned(),
     }
 }
 

@@ -10,7 +10,7 @@ use aws_sdk_bedrockruntime::types::{
     DocumentFormat, DocumentSource, ImageBlock, ImageFormat, ImageSource, Message,
     ReasoningContentBlock, ReasoningTextBlock, S3Location, StopReason, SystemContentBlock,
     SystemTool, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
-    ToolSpecification, ToolUseBlock,
+    ToolSpecification, ToolUseBlock, ToolUseType,
 };
 use aws_smithy_mocks::{Rule, RuleMode, mock, mock_client};
 use aws_smithy_types::{Blob, Document};
@@ -18,7 +18,7 @@ use opentelemetry::Value;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use serde_json::{Value as Json, json};
 
-use common::{event, exception, full_stream, stream_rule};
+use common::{assert_matches_schema, event, exception, full_stream, stream_rule};
 
 const INPUT_MESSAGES: &str = "gen_ai.input.messages";
 const OUTPUT_MESSAGES: &str = "gen_ai.output.messages";
@@ -49,14 +49,14 @@ impl Setup {
             aws_sdk_bedrockruntime,
             RuleMode::Sequential,
             &[rule],
-            move |config| config.interceptor(configure(BedrockInterceptor::with_tracer_provider(
-                provider
-            )))
+            move |config| config.interceptor(configure(
+                BedrockInterceptor::new().tracer_provider(provider)
+            ))
         )
     }
 
     fn capturing_client(&self, rule: &Rule) -> Client {
-        self.client(rule, |interceptor| interceptor.with_content_capture(true))
+        self.client(rule, |interceptor| interceptor.content_capture(true))
     }
 
     fn only_span(&self) -> SpanData {
@@ -73,12 +73,14 @@ fn attribute(span: &SpanData, key: &str) -> Option<Value> {
         .map(|kv| kv.value.clone())
 }
 
-/// The attribute `key`, parsed as JSON.
+/// The attribute `key`, parsed as JSON and checked against its schema.
 fn json_attribute(span: &SpanData, key: &str) -> Json {
-    match attribute(span, key) {
+    let value = match attribute(span, key) {
         Some(Value::String(value)) => serde_json::from_str(value.as_str()).unwrap(),
         other => panic!("{key} is not a string: {other:?}"),
-    }
+    };
+    assert_matches_schema(key, &value);
+    value
 }
 
 fn user(content: Vec<ContentBlock>) -> Message {
@@ -153,9 +155,7 @@ async fn disabling_capture_records_no_content() {
     let setup = Setup::new();
     let rule = mock!(Client::converse).then_output(|| converse_with(assistant(vec![text("Hi")])));
     let client = setup.client(&rule, |interceptor| {
-        interceptor
-            .with_content_capture(true)
-            .with_content_capture(false)
+        interceptor.content_capture(true).content_capture(false)
     });
 
     client
@@ -415,9 +415,7 @@ async fn long_text_is_cut_at_a_character_boundary() {
     let rule =
         mock!(Client::converse).then_output(|| converse_with(assistant(vec![text("abcdef")])));
     let client = setup.client(&rule, |interceptor| {
-        interceptor
-            .with_content_capture(true)
-            .with_max_content_length(4)
+        interceptor.content_capture(true).max_content_length(4)
     });
 
     client
@@ -562,7 +560,11 @@ async fn records_streamed_output() {
                     "name": "get_weather",
                     "arguments": { "city": "Paris" },
                 },
-                { "type": "tool_call_response", "id": "tool-2", "response": "18 degrees" },
+                {
+                    "type": "server_tool_call_response",
+                    "id": "tool-2",
+                    "server_tool_call_response": { "type": "unknown", "response": "18 degrees" },
+                },
                 { "type": "image", "mime_type": "image/png" },
             ],
         }])
@@ -653,9 +655,7 @@ async fn streamed_text_is_cut_to_the_maximum_length() {
     let setup = Setup::new();
     let rule = stream_rule(full_stream());
     let client = setup.client(&rule, |interceptor| {
-        interceptor
-            .with_content_capture(true)
-            .with_max_content_length(3)
+        interceptor.content_capture(true).max_content_length(3)
     });
 
     let mut output = client
@@ -680,9 +680,7 @@ async fn long_tool_arguments_and_results_are_cut() {
     let setup = Setup::new();
     let rule = mock!(Client::converse).then_output(|| converse_with(assistant(vec![text("Hi")])));
     let client = setup.client(&rule, |interceptor| {
-        interceptor
-            .with_content_capture(true)
-            .with_max_content_length(10)
+        interceptor.content_capture(true).max_content_length(10)
     });
 
     client
@@ -829,9 +827,7 @@ async fn streamed_tool_input_cut_to_nothing_is_an_empty_string() {
         event("messageStop", r#"{"stopReason":"tool_use"}"#),
     ]);
     let client = setup.client(&rule, |interceptor| {
-        interceptor
-            .with_content_capture(true)
-            .with_max_content_length(0)
+        interceptor.content_capture(true).max_content_length(0)
     });
 
     let mut output = client
@@ -848,5 +844,205 @@ async fn streamed_tool_input_cut_to_nothing_is_an_empty_string() {
     assert_eq!(
         json_attribute(&span, OUTPUT_MESSAGES)[0]["parts"][0]["arguments"],
         json!("")
+    );
+}
+
+fn server_tool_use() -> ContentBlock {
+    ContentBlock::ToolUse(
+        ToolUseBlock::builder()
+            .tool_use_id("server-1")
+            .name("nova_grounding")
+            .r#type(ToolUseType::ServerToolUse)
+            .input(Document::Object(
+                [("query".to_owned(), Document::String("news".to_owned()))].into(),
+            ))
+            .build()
+            .unwrap(),
+    )
+}
+
+fn server_tool_result() -> ContentBlock {
+    ContentBlock::ToolResult(
+        ToolResultBlock::builder()
+            .tool_use_id("server-1")
+            .content(ToolResultContentBlock::Text("headlines".into()))
+            .build()
+            .unwrap(),
+    )
+}
+
+fn server_parts() -> Json {
+    json!([
+        {
+            "type": "server_tool_call",
+            "id": "server-1",
+            "name": "nova_grounding",
+            "server_tool_call": { "type": "nova_grounding", "arguments": { "query": "news" } },
+        },
+        {
+            "type": "server_tool_call_response",
+            "id": "server-1",
+            "server_tool_call_response": { "type": "nova_grounding", "response": "headlines" },
+        },
+    ])
+}
+
+#[tokio::test]
+async fn tools_that_bedrock_runs_are_server_tool_calls() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse)
+        .then_output(|| converse_with(assistant(vec![server_tool_use(), server_tool_result()])));
+    let client = setup.capturing_client(&rule);
+
+    client
+        .converse()
+        .model_id("model")
+        .messages(user(vec![text("News?")]))
+        .messages(assistant(vec![server_tool_use()]))
+        // A result for a server tool is a server tool response, even in a user message.
+        .messages(user(vec![server_tool_result()]))
+        .send()
+        .await
+        .unwrap();
+
+    let span = setup.only_span();
+    let input = json_attribute(&span, INPUT_MESSAGES);
+    assert_eq!(input[1]["parts"][0], server_parts()[0]);
+    assert_eq!(input[2]["parts"][0], server_parts()[1]);
+    assert_eq!(
+        json_attribute(&span, OUTPUT_MESSAGES)[0]["parts"],
+        server_parts()
+    );
+}
+
+#[tokio::test]
+async fn streamed_tools_that_bedrock_runs_are_server_tool_calls() {
+    let setup = Setup::new();
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        event(
+            "contentBlockStart",
+            r#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"server-1","name":"nova_grounding","type":"server_tool_use"}}}"#,
+        ),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"query\":\"news\"}"}}}"#,
+        ),
+        event(
+            "contentBlockStart",
+            r#"{"contentBlockIndex":1,"start":{"toolResult":{"toolUseId":"server-1"}}}"#,
+        ),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":1,"delta":{"toolResult":[{"text":"headlines"}]}}"#,
+        ),
+        event("messageStop", r#"{"stopReason":"end_turn"}"#),
+    ]);
+    let client = setup.capturing_client(&rule);
+
+    let mut output = client
+        .converse_stream()
+        .model_id("model")
+        .messages(user(vec![text("News?")]))
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+    drop(output);
+
+    assert_eq!(
+        json_attribute(&setup.only_span(), OUTPUT_MESSAGES)[0]["parts"],
+        server_parts()
+    );
+}
+
+#[tokio::test]
+async fn results_in_assistant_messages_are_server_tool_responses() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse).then_output(|| converse_with(assistant(vec![text("Hi")])));
+    let client = setup.capturing_client(&rule);
+    let result = |tool_type: Option<&str>| {
+        ContentBlock::ToolResult(
+            ToolResultBlock::builder()
+                .tool_use_id("server-2")
+                .set_type(tool_type.map(str::to_owned))
+                .content(ToolResultContentBlock::Text("headlines".into()))
+                .build()
+                .unwrap(),
+        )
+    };
+
+    client
+        .converse()
+        .model_id("model")
+        .messages(assistant(vec![result(Some("web_search")), result(None)]))
+        .send()
+        .await
+        .unwrap();
+
+    let parts = &json_attribute(&setup.only_span(), INPUT_MESSAGES)[0]["parts"];
+    assert_eq!(
+        parts[0]["server_tool_call_response"],
+        json!({ "type": "web_search", "response": "headlines" })
+    );
+    assert_eq!(
+        parts[1]["server_tool_call_response"],
+        json!({ "type": "unknown", "response": "headlines" })
+    );
+}
+
+#[tokio::test]
+async fn server_tool_results_are_named_from_earlier_turns() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse)
+        .then_output(|| converse_with(assistant(vec![server_tool_result(), text("Done.")])));
+    let client = setup.capturing_client(&rule);
+
+    client
+        .converse()
+        .model_id("model")
+        .messages(user(vec![text("News?")]))
+        .messages(assistant(vec![server_tool_use()]))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        json_attribute(&setup.only_span(), OUTPUT_MESSAGES)[0]["parts"][0],
+        server_parts()[1]
+    );
+}
+
+#[tokio::test]
+async fn streamed_server_tool_results_are_named_from_earlier_turns() {
+    let setup = Setup::new();
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        event(
+            "contentBlockStart",
+            r#"{"contentBlockIndex":0,"start":{"toolResult":{"toolUseId":"server-1"}}}"#,
+        ),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"toolResult":[{"text":"headlines"}]}}"#,
+        ),
+        event("messageStop", r#"{"stopReason":"end_turn"}"#),
+    ]);
+    let client = setup.capturing_client(&rule);
+
+    let mut output = client
+        .converse_stream()
+        .model_id("model")
+        .messages(user(vec![text("News?")]))
+        .messages(assistant(vec![server_tool_use()]))
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+    drop(output);
+
+    assert_eq!(
+        json_attribute(&setup.only_span(), OUTPUT_MESSAGES)[0]["parts"][0],
+        server_parts()[1]
     );
 }

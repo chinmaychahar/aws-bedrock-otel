@@ -28,7 +28,7 @@ async fn spans(level: LevelFilter) -> Vec<SpanData> {
         aws_sdk_bedrockruntime,
         RuleMode::Sequential,
         &[&rule],
-        |config| config.interceptor(BedrockInterceptor::with_tracer_provider(&provider))
+        |config| config.interceptor(BedrockInterceptor::new().tracer_provider(&provider))
     );
     async { client.converse().model_id("m").send().await.unwrap() }
         .instrument(tracing::info_span!("request"))
@@ -80,7 +80,9 @@ async fn tracing_spans_created_in_a_tool_call_are_its_children() {
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("app")));
     let _guard = tracing::subscriber::set_default(subscriber);
-    let tools = BedrockInterceptor::with_tracer_provider(&provider).tool_tracer();
+    let tools = BedrockInterceptor::new()
+        .tracer_provider(&provider)
+        .tool_tracer();
 
     async {
         let call = tools.tool("lookup").start();

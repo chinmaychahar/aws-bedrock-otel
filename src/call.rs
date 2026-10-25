@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use opentelemetry::trace::{SpanRef, Status, TraceContextExt};
 use opentelemetry::{Context, KeyValue};
@@ -11,7 +11,7 @@ use crate::attributes::{
     AWS_REQUEST_ID, ERROR_TYPE, FINISH_REASON_ERROR, GEN_AI_OUTPUT_MESSAGES, TokenUsage,
     finish_reasons, usage_attributes,
 };
-use crate::content::ContentCapture;
+use crate::content::{ContentCapture, ServerToolNames};
 use crate::metrics::Metrics;
 
 /// A `Converse` or `ConverseStream` call. It is finished exactly once, by whichever part sees
@@ -20,8 +20,12 @@ use crate::metrics::Metrics;
 pub(crate) struct Call {
     context: Context,
     started: Instant,
+    /// When the span started, so its end time matches the recorded duration.
+    started_at: SystemTime,
     metrics: Option<Metrics>,
     capture: Option<ContentCapture>,
+    /// Server tools used in the request, for naming their results in the response.
+    server_tools: ServerToolNames,
     metric_attributes: Vec<KeyValue>,
     /// `metric_attributes` plus the server attributes, once the endpoint is known.
     full_metric_attributes: OnceLock<Vec<KeyValue>>,
@@ -34,15 +38,19 @@ pub(crate) struct Call {
 impl Call {
     pub(crate) fn new(
         context: Context,
+        (started, started_at): (Instant, SystemTime),
         metrics: Option<Metrics>,
-        capture: Option<ContentCapture>,
+        capture: Option<(ContentCapture, ServerToolNames)>,
         metric_attributes: Vec<KeyValue>,
     ) -> Self {
+        let (capture, server_tools) = capture.unzip();
         Self {
             context,
-            started: Instant::now(),
+            started,
+            started_at,
             metrics,
             capture,
+            server_tools: server_tools.unwrap_or_default(),
             metric_attributes,
             full_metric_attributes: OnceLock::new(),
             request_id: Mutex::new(None),
@@ -60,6 +68,11 @@ impl Call {
         self.started
     }
 
+    /// Whether anything is recorded for this call.
+    pub(crate) fn is_recorded(&self) -> bool {
+        self.metrics.is_some() || self.span().is_recording()
+    }
+
     /// How to capture content, if capture is on.
     pub(crate) fn capture(&self) -> Option<&ContentCapture> {
         self.capture.as_ref()
@@ -67,10 +80,13 @@ impl Call {
 
     /// Sets `gen_ai.output.messages` from `output`, if capture is on and the call hasn't
     /// finished.
-    pub(crate) fn set_output(&self, output: impl FnOnce(&ContentCapture) -> Option<String>) {
+    pub(crate) fn set_output(
+        &self,
+        output: impl FnOnce(&ContentCapture, &ServerToolNames) -> Option<String>,
+    ) {
         if let Some(capture) = &self.capture
             && !self.finished.load(Ordering::Acquire)
-            && let Some(output) = output(capture)
+            && let Some(output) = output(capture, &self.server_tools)
         {
             self.span()
                 .set_attribute(KeyValue::new(GEN_AI_OUTPUT_MESSAGES, output));
@@ -145,6 +161,9 @@ impl Call {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
+        // The span and the metrics get the same duration. The end time follows the monotonic
+        // clock, so a wall clock change during the call doesn't move it.
+        let duration = self.started.elapsed();
         let span = self.context.span();
         let request_id = self
             .request_id
@@ -166,13 +185,8 @@ impl Call {
             span.set_status(Status::error(error_type.to_owned()));
         }
         if let Some(metrics) = &self.metrics {
-            metrics.record_call(
-                self.metric_attributes(),
-                self.started.elapsed(),
-                usage,
-                error_type,
-            );
+            metrics.record_call(self.metric_attributes(), duration, usage, error_type);
         }
-        span.end();
+        span.end_with_timestamp(self.started_at + duration);
     }
 }

@@ -13,7 +13,7 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMete
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use serde_json::{Value as Json, json};
 
-use common::metric_points;
+use common::{assert_matches_schema, metric_points};
 
 const DURATION: &str = "gen_ai.execute_tool.duration";
 
@@ -43,8 +43,9 @@ impl Setup {
     }
 
     fn interceptor(&self) -> BedrockInterceptor {
-        BedrockInterceptor::with_tracer_provider(&self.tracer_provider)
-            .with_meter_provider(&self.meter_provider)
+        BedrockInterceptor::new()
+            .tracer_provider(&self.tracer_provider)
+            .meter_provider(&self.meter_provider)
     }
 
     fn spans(&self) -> Vec<SpanData> {
@@ -242,13 +243,14 @@ fn metric_duration_matches_the_span() {
         .as_secs_f64();
     let points = setup.durations();
     assert!(points[0].sum >= 0.02, "{}", points[0].sum);
-    assert_eq!(points[0].sum, span_seconds);
+    // Equal, within the 100 ns resolution of `SystemTime` on Windows.
+    assert!((points[0].sum - span_seconds).abs() < 1e-6);
 }
 
 #[test]
 fn failures_record_the_error_type() {
     let setup = Setup::new();
-    let tools = setup.interceptor().with_content_capture(true).tool_tracer();
+    let tools = setup.interceptor().content_capture(true).tool_tracer();
 
     tools.tool_use(&weather_call()).start().fail("timeout");
 
@@ -261,7 +263,7 @@ fn failures_record_the_error_type() {
 #[test]
 fn error_results_are_failures_without_a_result() {
     let setup = Setup::new();
-    let tools = setup.interceptor().with_content_capture(true).tool_tracer();
+    let tools = setup.interceptor().content_capture(true).tool_tracer();
     let error = ToolResultBlock::builder()
         .tool_use_id("tool-1")
         .content(ToolResultContentBlock::Text("city not found".into()))
@@ -324,7 +326,7 @@ fn content_is_not_captured_by_default() {
 #[test]
 fn captures_arguments_and_result() {
     let setup = Setup::new();
-    let tools = setup.interceptor().with_content_capture(true).tool_tracer();
+    let tools = setup.interceptor().content_capture(true).tool_tracer();
 
     tools
         .tool_use(&weather_call())
@@ -332,20 +334,18 @@ fn captures_arguments_and_result() {
         .end_with_result(&json_result());
 
     let span = setup.only_span();
-    assert_eq!(
-        json_attribute(&span, "gen_ai.tool.call.arguments"),
-        json!({ "city": "Paris" })
-    );
-    assert_eq!(
-        json_attribute(&span, "gen_ai.tool.call.result"),
-        json!({ "celsius": 18 })
-    );
+    let arguments = json_attribute(&span, "gen_ai.tool.call.arguments");
+    let result = json_attribute(&span, "gen_ai.tool.call.result");
+    assert_matches_schema("gen_ai.tool.call.arguments", &arguments);
+    assert_matches_schema("gen_ai.tool.call.result", &result);
+    assert_eq!(arguments, json!({ "city": "Paris" }));
+    assert_eq!(result, json!({ "celsius": 18 }));
 }
 
 /// The recorded `gen_ai.tool.call.result` for a successful call with `content`.
 fn recorded_result(content: Vec<ToolResultContentBlock>) -> Json {
     let setup = Setup::new();
-    let tools = setup.interceptor().with_content_capture(true).tool_tracer();
+    let tools = setup.interceptor().content_capture(true).tool_tracer();
     tools.tool("tool").start().end_with_result(&result(content));
     json_attribute(&setup.only_span(), "gen_ai.tool.call.result")
 }
@@ -380,8 +380,8 @@ fn long_arguments_and_results_are_cut() {
     let setup = Setup::new();
     let tools = setup
         .interceptor()
-        .with_content_capture(true)
-        .with_max_content_length(10)
+        .content_capture(true)
+        .max_content_length(10)
         .tool_tracer();
 
     tools
@@ -421,12 +421,12 @@ fn spans_inside_the_call_are_its_children() {
 }
 
 #[test]
-fn without_spans_records_metrics_only() {
+fn spans_off_records_metrics_only() {
     let setup = Setup::new();
     let tools = setup
         .interceptor()
-        .without_spans()
-        .with_content_capture(true)
+        .spans(false)
+        .content_capture(true)
         .tool_tracer();
 
     let parent = setup.tracer_provider.tracer("app").start("agent");
@@ -450,9 +450,9 @@ fn without_spans_records_metrics_only() {
 }
 
 #[test]
-fn without_metrics_records_spans_only() {
+fn metrics_off_records_spans_only() {
     let setup = Setup::new();
-    let tools = setup.interceptor().without_metrics().tool_tracer();
+    let tools = setup.interceptor().metrics(false).tool_tracer();
 
     tools.tool_use(&weather_call()).start().end();
 
@@ -514,7 +514,7 @@ fn panics_are_recorded_as_other() {
 #[test]
 fn empty_results_are_not_recorded() {
     let setup = Setup::new();
-    let tools = setup.interceptor().with_content_capture(true).tool_tracer();
+    let tools = setup.interceptor().content_capture(true).tool_tracer();
 
     tools
         .tool("lookup")
@@ -577,8 +577,8 @@ fn results_cut_to_nothing_are_still_recorded() {
     let setup = Setup::new();
     let tools = setup
         .interceptor()
-        .with_content_capture(true)
-        .with_max_content_length(0)
+        .content_capture(true)
+        .max_content_length(0)
         .tool_tracer();
 
     tools

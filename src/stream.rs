@@ -212,7 +212,7 @@ impl Recorder {
             // Output that was received is recorded, even if the stream failed.
             if let Some(streamed) = self.streamed.take() {
                 self.call
-                    .set_output(|capture| streamed.output_messages(capture));
+                    .set_output(|capture, earlier| streamed.output_messages(capture, earlier));
             }
             self.call
                 .finish(self.usage.as_ref(), self.stop_reason.as_deref(), error_type);
@@ -293,6 +293,7 @@ mod tests {
         let span = provider.tracer("test").start("chat");
         let call = Arc::new(Call::new(
             Context::current_with_span(span),
+            (Instant::now(), std::time::SystemTime::now()),
             None,
             None,
             Vec::new(),

@@ -49,8 +49,9 @@ impl Setup {
             RuleMode::Sequential,
             &[rule],
             move |config| config.interceptor(configure(
-                BedrockInterceptor::with_tracer_provider(tracer_provider)
-                    .with_meter_provider(meter_provider)
+                BedrockInterceptor::new()
+                    .tracer_provider(tracer_provider)
+                    .meter_provider(meter_provider)
             ))
         )
     }
@@ -73,10 +74,10 @@ impl Setup {
 }
 
 #[tokio::test]
-async fn without_spans_records_metrics_and_leaves_the_current_span_alone() {
+async fn spans_off_records_metrics_and_leaves_the_current_span_alone() {
     let setup = Setup::new();
     let rule = mock!(Client::converse).then_output(converse_output);
-    let client = setup.client(&rule, BedrockInterceptor::without_spans);
+    let client = setup.client(&rule, |interceptor| interceptor.spans(false));
 
     let parent = setup.tracer_provider.tracer("app").start("request");
     let parent_context = Context::current_with_span(parent);
@@ -111,10 +112,10 @@ async fn without_spans_records_metrics_and_leaves_the_current_span_alone() {
 }
 
 #[tokio::test]
-async fn without_spans_records_metrics_for_streams() {
+async fn spans_off_records_metrics_for_streams() {
     let setup = Setup::new();
     let rule = stream_rule(full_stream());
-    let client = setup.client(&rule, BedrockInterceptor::without_spans);
+    let client = setup.client(&rule, |interceptor| interceptor.spans(false));
 
     let parent = setup.tracer_provider.tracer("app").start("request");
     let parent_context = Context::current_with_span(parent);
@@ -139,10 +140,10 @@ async fn without_spans_records_metrics_for_streams() {
 }
 
 #[tokio::test]
-async fn without_metrics_records_spans_only() {
+async fn metrics_off_records_spans_only() {
     let setup = Setup::new();
     let rule = mock!(Client::converse).then_output(converse_output);
-    let client = setup.client(&rule, BedrockInterceptor::without_metrics);
+    let client = setup.client(&rule, |interceptor| interceptor.metrics(false));
 
     client
         .converse()
@@ -156,11 +157,11 @@ async fn without_metrics_records_spans_only() {
 }
 
 #[tokio::test]
-async fn without_spans_leaves_the_current_span_alone_on_errors() {
+async fn spans_off_leaves_the_current_span_alone_on_errors() {
     let setup = Setup::new();
     let rule = mock!(Client::converse)
         .then_error(|| ConverseError::ValidationException(ValidationException::builder().build()));
-    let client = setup.client(&rule, BedrockInterceptor::without_spans);
+    let client = setup.client(&rule, |interceptor| interceptor.spans(false));
 
     let parent = setup.tracer_provider.tracer("app").start("request");
     let parent_context = Context::current_with_span(parent);
@@ -181,12 +182,10 @@ async fn without_spans_leaves_the_current_span_alone_on_errors() {
 }
 
 #[tokio::test]
-async fn without_spans_and_metrics_records_nothing() {
+async fn spans_and_metrics_off_records_nothing() {
     let setup = Setup::new();
     let rule = mock!(Client::converse).then_output(converse_output);
-    let client = setup.client(&rule, |interceptor| {
-        interceptor.without_spans().without_metrics()
-    });
+    let client = setup.client(&rule, |interceptor| interceptor.spans(false).metrics(false));
 
     client
         .converse()
@@ -200,7 +199,7 @@ async fn without_spans_and_metrics_records_nothing() {
 }
 
 #[tokio::test]
-async fn without_metrics_takes_precedence_over_a_meter_provider() {
+async fn metrics_off_takes_precedence_over_a_meter_provider() {
     let setup = Setup::new();
     let rule = mock!(Client::converse).then_output(converse_output);
     let meter_provider = setup.meter_provider.clone();
@@ -210,9 +209,10 @@ async fn without_metrics_takes_precedence_over_a_meter_provider() {
         RuleMode::Sequential,
         &[&rule],
         move |config| config.interceptor(
-            BedrockInterceptor::with_tracer_provider(&tracer_provider)
-                .without_metrics()
-                .with_meter_provider(&meter_provider)
+            BedrockInterceptor::new()
+                .tracer_provider(&tracer_provider)
+                .metrics(false)
+                .meter_provider(&meter_provider)
         )
     );
 

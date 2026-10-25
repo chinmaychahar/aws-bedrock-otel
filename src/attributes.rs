@@ -66,7 +66,7 @@ pub(crate) fn request_attributes(
         KeyValue::new(GEN_AI_OPERATION_NAME, OPERATION_CHAT),
         KeyValue::new(GEN_AI_PROVIDER_NAME, PROVIDER_AWS_BEDROCK),
     ];
-    if let Some(model) = model {
+    if let Some(model) = model.filter(|model| !model.is_empty()) {
         attributes.push(KeyValue::new(GEN_AI_REQUEST_MODEL, model.to_owned()));
     }
     if let Some(config) = config {
@@ -142,10 +142,11 @@ pub(crate) fn usage_attributes(usage: &TokenUsage) -> Vec<KeyValue> {
         KeyValue::new(GEN_AI_USAGE_INPUT_TOKENS, usage.total_input()),
         KeyValue::new(GEN_AI_USAGE_OUTPUT_TOKENS, usage.output),
     ];
-    if let Some(tokens) = usage.cache_read {
+    // The convention records cached tokens only when non-zero.
+    if let Some(tokens) = usage.cache_read.filter(|tokens| *tokens != 0) {
         attributes.push(KeyValue::new(GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS, tokens));
     }
-    if let Some(tokens) = usage.cache_write {
+    if let Some(tokens) = usage.cache_write.filter(|tokens| *tokens != 0) {
         attributes.push(KeyValue::new(GEN_AI_USAGE_CACHE_WRITE_INPUT_TOKENS, tokens));
     }
     attributes
@@ -157,7 +158,7 @@ pub(crate) fn metric_attributes(model: Option<&str>) -> Vec<KeyValue> {
         KeyValue::new(GEN_AI_OPERATION_NAME, OPERATION_CHAT),
         KeyValue::new(GEN_AI_PROVIDER_NAME, PROVIDER_AWS_BEDROCK),
     ];
-    if let Some(model) = model {
+    if let Some(model) = model.filter(|model| !model.is_empty()) {
         attributes.push(KeyValue::new(GEN_AI_REQUEST_MODEL, model.to_owned()));
     }
     attributes
@@ -219,12 +220,12 @@ mod tests {
     }
 
     #[test]
-    fn usage_attributes_skip_missing_cache_counts() {
+    fn usage_attributes_skip_missing_and_zero_cache_counts() {
         let usage = TokenUsage {
             input: 10,
             output: 5,
-            cache_read: None,
-            cache_write: Some(0),
+            cache_read: Some(0),
+            cache_write: Some(2),
         };
         let keys: Vec<_> = usage_attributes(&usage)
             .into_iter()
@@ -261,6 +262,7 @@ mod tests {
     #[test]
     fn metric_attributes_omit_missing_model() {
         assert_eq!(metric_attributes(None).len(), 2);
+        assert_eq!(metric_attributes(Some("")).len(), 2);
         assert!(metric_attributes(Some("m")).contains(&KeyValue::new(GEN_AI_REQUEST_MODEL, "m")));
     }
 }

@@ -71,8 +71,9 @@ impl Setup {
                 .with_test_defaults_v2()
                 .http_client(NeverResponds)
                 .interceptor(
-                    BedrockInterceptor::with_tracer_provider(&tracer_provider)
-                        .with_meter_provider(&meter_provider),
+                    BedrockInterceptor::new()
+                        .tracer_provider(&tracer_provider)
+                        .meter_provider(&meter_provider),
                 ),
         )
         .build();

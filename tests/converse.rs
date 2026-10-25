@@ -42,7 +42,7 @@ impl Setup {
             aws_sdk_bedrockruntime,
             RuleMode::Sequential,
             &[rule],
-            move |config| config.interceptor(BedrockInterceptor::with_tracer_provider(provider))
+            move |config| config.interceptor(BedrockInterceptor::new().tracer_provider(provider))
         )
     }
 
@@ -430,7 +430,7 @@ async fn request_id_is_from_the_latest_response_when_another_interceptor_fails()
         RuleMode::Sequential,
         &[&rule],
         move |config| config
-            .interceptor(BedrockInterceptor::with_tracer_provider(provider))
+            .interceptor(BedrockInterceptor::new().tracer_provider(provider))
             .interceptor(FailSecondTransmit)
     );
 
@@ -447,4 +447,70 @@ async fn request_id_is_from_the_latest_response_when_another_interceptor_fails()
         attribute(&span, "aws.request_id"),
         Some(Value::from("second"))
     );
+}
+
+#[tokio::test]
+async fn calls_without_a_model_have_a_plain_span_name() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse).then_output(converse_output);
+    let client = setup.client(&rule);
+
+    let _ = client.converse().model_id("").send().await;
+
+    let span = setup.only_span();
+    assert_eq!(span.name, "chat");
+    assert_eq!(attribute(&span, "gen_ai.request.model"), None);
+}
+
+#[tokio::test]
+async fn concurrent_calls_are_recorded_separately() {
+    let setup = Setup::new();
+    let rule = mock!(Client::converse)
+        .sequence()
+        .output(converse_output)
+        .repeatedly()
+        .build();
+    let client = setup.client(&rule);
+
+    let calls = (0..8).map(|i| {
+        let client = client.clone();
+        async move {
+            client
+                .converse()
+                .model_id(format!("model-{i}"))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    futures_join_all(calls).await;
+
+    let mut spans = setup.exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 8);
+    spans.sort_by(|a, b| a.name.cmp(&b.name));
+    for (i, span) in spans.iter().enumerate() {
+        assert_eq!(span.name, format!("chat model-{i}"));
+        assert_eq!(
+            attribute(span, "gen_ai.request.model"),
+            Some(Value::from(format!("model-{i}")))
+        );
+        assert_eq!(
+            attribute(span, "gen_ai.usage.output_tokens"),
+            Some(Value::I64(5))
+        );
+    }
+}
+
+/// Runs the futures concurrently on the current task.
+async fn futures_join_all<F: std::future::Future>(futures: impl Iterator<Item = F>) {
+    let mut futures: Vec<_> = futures.map(Box::pin).collect();
+    std::future::poll_fn(|cx| {
+        futures.retain_mut(|future| future.as_mut().poll(cx).is_pending());
+        if futures.is_empty() {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
 }

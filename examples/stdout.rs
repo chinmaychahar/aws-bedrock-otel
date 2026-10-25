@@ -28,8 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
         .interceptor(
-            BedrockInterceptor::with_tracer_provider(&tracer_provider)
-                .with_meter_provider(&meter_provider),
+            BedrockInterceptor::new()
+                .tracer_provider(&tracer_provider)
+                .meter_provider(&meter_provider),
         )
         .build();
     let client = aws_sdk_bedrockruntime::Client::from_conf(config);

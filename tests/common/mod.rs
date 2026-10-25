@@ -87,7 +87,8 @@ pub fn repeated_stream_rule(messages: Vec<Message>) -> Rule {
         .build()
 }
 
-fn stream_response(
+/// A `ConverseStream` HTTP response with the given events and raw bytes after them.
+pub fn stream_response(
     messages: Vec<Message>,
     trailer: &[u8],
 ) -> impl Fn() -> Response<SdkBody> + Send + Sync + 'static {
@@ -214,4 +215,80 @@ pub fn converse_http_rule() -> Rule {
             "converse-request-id",
         )
     })
+}
+
+/// The JSON schema for a content attribute, from the GenAI semantic conventions.
+fn schema(attribute: &str) -> Option<&'static str> {
+    Some(match attribute {
+        "gen_ai.input.messages" => include_str!("../schemas/gen-ai-input-messages.json"),
+        "gen_ai.output.messages" => include_str!("../schemas/gen-ai-output-messages.json"),
+        "gen_ai.system_instructions" => include_str!("../schemas/gen-ai-system-instructions.json"),
+        "gen_ai.tool.definitions" => include_str!("../schemas/gen-ai-tool-definitions.json"),
+        "gen_ai.tool.call.arguments" => include_str!("../schemas/gen-ai-tool-call-arguments.json"),
+        "gen_ai.tool.call.result" => include_str!("../schemas/gen-ai-tool-call-result.json"),
+        _ => return None,
+    })
+}
+
+/// Panics if `value` doesn't match the schema of `attribute`.
+///
+/// The schemas accept any object with a `type` as a part, so each part with a known `type` is
+/// also checked against its own definition.
+pub fn assert_matches_schema(attribute: &str, value: &serde_json::Value) {
+    let schema = schema(attribute).unwrap_or_else(|| panic!("no schema for {attribute}"));
+    let schema: serde_json::Value = serde_json::from_str(schema).unwrap();
+    assert_valid(attribute, &schema, value);
+
+    let Some(definitions) = schema["$defs"].as_object() else {
+        return;
+    };
+    let parts: Vec<&serde_json::Value> = match attribute {
+        "gen_ai.input.messages" | "gen_ai.output.messages" => value
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap())
+            .collect(),
+        "gen_ai.system_instructions" | "gen_ai.tool.definitions" => {
+            value.as_array().unwrap().iter().collect()
+        }
+        _ => Vec::new(),
+    };
+    for part in parts {
+        let definition = definitions
+            .iter()
+            .find(|(_, definition)| definition["properties"]["type"]["const"] == part["type"]);
+        if let Some((name, _)) = definition {
+            let part_schema = serde_json::json!({
+                "$ref": format!("#/$defs/{name}"),
+                "$defs": definitions,
+            });
+            assert_valid(attribute, &part_schema, part);
+        }
+    }
+}
+
+fn assert_valid(attribute: &str, schema: &serde_json::Value, value: &serde_json::Value) {
+    // Tool definitions refer to the JSON Schema draft-07 meta-schema for tool parameters,
+    // which are never recorded, so any schema is accepted there.
+    let registry = jsonschema::Registry::new()
+        .add(
+            "http://json-schema.org/draft-07/schema",
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .prepare()
+        .unwrap();
+    let validator = jsonschema::options()
+        .with_registry(&registry)
+        .build(schema)
+        .unwrap();
+    let errors: Vec<String> = validator
+        .iter_errors(value)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{attribute} doesn't match its schema: {errors:?}\n{value}"
+    );
 }

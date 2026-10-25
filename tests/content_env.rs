@@ -25,9 +25,9 @@ async fn captures(configure: fn(BedrockInterceptor) -> BedrockInterceptor) -> bo
         aws_sdk_bedrockruntime,
         RuleMode::Sequential,
         &[&rule],
-        |config| config.interceptor(configure(BedrockInterceptor::with_tracer_provider(
-            &provider
-        )))
+        |config| config.interceptor(configure(
+            BedrockInterceptor::new().tracer_provider(&provider)
+        ))
     );
     client
         .converse()
@@ -56,7 +56,9 @@ fn tool_tracer_captures() -> bool {
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let tools = BedrockInterceptor::with_tracer_provider(&provider).tool_tracer();
+    let tools = BedrockInterceptor::new()
+        .tracer_provider(&provider)
+        .tool_tracer();
     let arguments = aws_smithy_types::Document::Object(Default::default());
     tools.tool("lookup").arguments(&arguments).start().end();
     let spans = exporter.get_finished_spans().unwrap();
@@ -84,12 +86,12 @@ async fn environment_variable_turns_capture_on() {
     set_env(Some("TRUE"));
     assert!(captures(|i| i).await);
     assert!(tool_tracer_captures());
-    assert!(!captures(|i| i.with_content_capture(false)).await);
+    assert!(!captures(|i| i.content_capture(false)).await);
 
     set_env(Some("1"));
     assert!(!captures(|i| i).await);
     assert!(!tool_tracer_captures());
-    assert!(captures(|i| i.with_content_capture(true)).await);
+    assert!(captures(|i| i.content_capture(true)).await);
 
     set_env(None);
 }

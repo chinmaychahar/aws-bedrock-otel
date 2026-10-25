@@ -3,13 +3,13 @@
 //!
 //! Media sent as bytes is recorded without the bytes; media stored in S3 is recorded by URI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use aws_sdk_bedrockruntime::types::{
     AudioSource, CitationGeneratedContent, ContentBlock, ConversationRole, DocumentContentBlock,
     DocumentFormat, DocumentSource, GuardrailConverseContentBlock, ImageSource, Message,
     ReasoningContentBlock, SystemContentBlock, Tool, ToolConfiguration, ToolResultBlock,
-    ToolResultContentBlock, VideoSource,
+    ToolResultContentBlock, ToolUseType, VideoSource,
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::{Map, Value as Json, json};
@@ -72,25 +72,41 @@ impl ContentCapture {
 
     /// `gen_ai.input.messages`, or `None` if there are none.
     pub(crate) fn input_messages(&self, messages: &[Message]) -> Option<String> {
-        let messages: Vec<Json> = messages.iter().map(|m| self.message(m)).collect();
+        let server_tools = server_tools(messages);
+        let messages: Vec<Json> = messages
+            .iter()
+            .map(|m| self.message(m, &server_tools))
+            .collect();
         (!messages.is_empty()).then(|| Json::Array(messages).to_string())
     }
 
-    /// `gen_ai.output.messages` for a single response message.
-    pub(crate) fn output_messages(&self, message: &Message) -> String {
-        Json::Array(vec![self.message(message)]).to_string()
+    /// `gen_ai.output.messages` for a single response message. `earlier` names the server
+    /// tools used in the request.
+    pub(crate) fn output_messages(&self, message: &Message, earlier: &ServerToolNames) -> String {
+        let mut server_tools = server_tools(std::slice::from_ref(message));
+        server_tools.extend(
+            earlier
+                .iter()
+                .map(|(id, name)| (id.as_str(), name.as_str())),
+        );
+        Json::Array(vec![self.message(message, &server_tools)]).to_string()
     }
 
-    fn message(&self, message: &Message) -> Json {
+    fn message(&self, message: &Message, server_tools: &ServerTools<'_>) -> Json {
         let parts: Vec<Json> = message
             .content()
             .iter()
-            .filter_map(|block| self.part(block))
+            .filter_map(|block| self.part(block, message.role(), server_tools))
             .collect();
         json!({ "role": role(message.role()), "parts": parts })
     }
 
-    fn part(&self, block: &ContentBlock) -> Option<Json> {
+    fn part(
+        &self,
+        block: &ContentBlock,
+        role: &ConversationRole,
+        server_tools: &ServerTools<'_>,
+    ) -> Option<Json> {
         Some(match block {
             ContentBlock::Text(text) => self.text_part(text),
             ContentBlock::Image(image) => {
@@ -142,17 +158,31 @@ impl ContentCapture {
                     _ => media("document", mime_type, None),
                 }
             }
-            ContentBlock::ToolUse(tool_use) => json!({
-                "type": "tool_call",
-                "id": tool_use.tool_use_id(),
-                "name": tool_use.name(),
-                "arguments": self.json(document_to_json(tool_use.input())),
-            }),
-            ContentBlock::ToolResult(result) => json!({
-                "type": "tool_call_response",
-                "id": result.tool_use_id(),
-                "response": self.tool_response(result),
-            }),
+            ContentBlock::ToolUse(tool_use) => {
+                let arguments = self.json(document_to_json(tool_use.input()));
+                if tool_use.r#type() == Some(&ToolUseType::ServerToolUse) {
+                    server_tool_call(tool_use.tool_use_id(), tool_use.name(), arguments)
+                } else {
+                    json!({
+                        "type": "tool_call",
+                        "id": tool_use.tool_use_id(),
+                        "name": tool_use.name(),
+                        "arguments": arguments,
+                    })
+                }
+            }
+            ContentBlock::ToolResult(result) => {
+                let id = result.tool_use_id();
+                let response = self.tool_response(result);
+                // Bedrock returns the results of the tools it runs in assistant messages.
+                let server_tool = server_tools.get(id).copied();
+                if server_tool.is_some() || role == &ConversationRole::Assistant {
+                    let tool_type = server_tool.or(result.r#type());
+                    server_tool_call_response(id, tool_type, response)
+                } else {
+                    json!({ "type": "tool_call_response", "id": id, "response": response })
+                }
+            }
             ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(reasoning)) => {
                 json!({ "type": "reasoning", "content": self.text(reasoning.text()) })
             }
@@ -236,6 +266,56 @@ impl ContentCapture {
             _ => return None,
         })
     }
+}
+
+/// The names of the tools that Bedrock runs itself, by tool use ID.
+type ServerTools<'a> = HashMap<&'a str, &'a str>;
+
+/// [`ServerTools`] kept from the request until the response arrives.
+pub(crate) type ServerToolNames = HashMap<String, String>;
+
+pub(crate) fn server_tool_names(messages: &[Message]) -> ServerToolNames {
+    server_tools(messages)
+        .into_iter()
+        .map(|(id, name)| (id.to_owned(), name.to_owned()))
+        .collect()
+}
+
+fn server_tools(messages: &[Message]) -> ServerTools<'_> {
+    messages
+        .iter()
+        .flat_map(Message::content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse(tool_use)
+                if tool_use.r#type() == Some(&ToolUseType::ServerToolUse) =>
+            {
+                Some((tool_use.tool_use_id(), tool_use.name()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `server_tool_call` part. Its details are typed by the tool name.
+fn server_tool_call(id: &str, name: &str, arguments: Json) -> Json {
+    json!({
+        "type": "server_tool_call",
+        "id": id,
+        "name": name,
+        "server_tool_call": { "type": name, "arguments": arguments },
+    })
+}
+
+/// A `server_tool_call_response` part, typed by the tool name when it is known.
+fn server_tool_call_response(id: &str, tool_type: Option<&str>, response: Json) -> Json {
+    json!({
+        "type": "server_tool_call_response",
+        "id": id,
+        "server_tool_call_response": {
+            "type": tool_type.unwrap_or("unknown"),
+            "response": response,
+        },
+    })
 }
 
 /// `gen_ai.tool.definitions`, with only the required `type` and `name` of each tool.
@@ -367,12 +447,15 @@ enum StreamedBlock {
     ToolUse {
         id: String,
         name: String,
+        /// Whether Bedrock runs the tool itself.
+        server: bool,
         /// `None` until the first input delta.
         input: Option<String>,
     },
     /// The result of a tool that Bedrock runs, such as a system tool.
     ToolResult {
         id: String,
+        tool_type: Option<String>,
         text: String,
         json: Vec<Json>,
         /// Bytes of JSON kept, to stop keeping more past the maximum length.
@@ -405,11 +488,13 @@ impl StreamedMessage {
             StreamedBlock::ToolUse {
                 id: string(&start["toolUse"]["toolUseId"]),
                 name: string(&start["toolUse"]["name"]),
+                server: start["toolUse"]["type"] == ToolUseType::ServerToolUse.as_str(),
                 input: None,
             }
         } else if start["toolResult"].is_object() {
             StreamedBlock::ToolResult {
                 id: string(&start["toolResult"]["toolUseId"]),
+                tool_type: start["toolResult"]["type"].as_str().map(str::to_owned),
                 text: String::new(),
                 json: Vec::new(),
                 json_length: 0,
@@ -476,11 +561,34 @@ impl StreamedMessage {
         }
     }
 
-    /// `gen_ai.output.messages`, or `None` if nothing was received.
-    pub(crate) fn output_messages(&self, capture: &ContentCapture) -> Option<String> {
+    /// `gen_ai.output.messages`, or `None` if nothing was received. `earlier` names the server
+    /// tools used in the request.
+    pub(crate) fn output_messages(
+        &self,
+        capture: &ContentCapture,
+        earlier: &ServerToolNames,
+    ) -> Option<String> {
         if self.blocks.is_empty() {
             return None;
         }
+        let server_tools: ServerTools<'_> = self
+            .blocks
+            .values()
+            .filter_map(|block| match block {
+                StreamedBlock::ToolUse {
+                    id,
+                    name,
+                    server: true,
+                    ..
+                } => Some((id.as_str(), name.as_str())),
+                _ => None,
+            })
+            .chain(
+                earlier
+                    .iter()
+                    .map(|(id, name)| (id.as_str(), name.as_str())),
+            )
+            .collect();
         let parts: Vec<Json> = self
             .blocks
             .values()
@@ -489,7 +597,12 @@ impl StreamedMessage {
                 StreamedBlock::Reasoning(text) => {
                     json!({ "type": "reasoning", "content": capture.text(text) })
                 }
-                StreamedBlock::ToolUse { id, name, input } => {
+                StreamedBlock::ToolUse {
+                    id,
+                    name,
+                    server,
+                    input,
+                } => {
                     // Arguments arrive as JSON text in pieces; keep them as text if incomplete.
                     let arguments = match input {
                         None => json!({}),
@@ -497,9 +610,24 @@ impl StreamedMessage {
                             .map(|arguments| capture.json(arguments))
                             .unwrap_or_else(|_| capture.text(input)),
                     };
-                    json!({ "type": "tool_call", "id": id, "name": name, "arguments": arguments })
+                    if *server {
+                        server_tool_call(id, name, arguments)
+                    } else {
+                        json!({
+                            "type": "tool_call",
+                            "id": id,
+                            "name": name,
+                            "arguments": arguments,
+                        })
+                    }
                 }
-                StreamedBlock::ToolResult { id, text, json, .. } => {
+                StreamedBlock::ToolResult {
+                    id,
+                    tool_type,
+                    text,
+                    json,
+                    ..
+                } => {
                     let mut responses: Vec<Json> = json
                         .iter()
                         .map(|value| capture.json(value.clone()))
@@ -512,7 +640,12 @@ impl StreamedMessage {
                     } else {
                         Json::Array(responses)
                     };
-                    json!({ "type": "tool_call_response", "id": id, "response": response })
+                    // Results in a response come from tools that Bedrock runs.
+                    let tool_type = server_tools
+                        .get(id.as_str())
+                        .copied()
+                        .or(tool_type.as_deref());
+                    server_tool_call_response(id, tool_type, response)
                 }
                 StreamedBlock::Image { mime_type } => media("image", mime_type.clone(), None),
             })

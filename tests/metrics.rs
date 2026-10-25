@@ -91,8 +91,9 @@ impl Setup {
             RuleMode::Sequential,
             &[rule],
             move |config| config.interceptor(
-                BedrockInterceptor::with_tracer_provider(tracer_provider)
-                    .with_meter_provider(meter_provider)
+                BedrockInterceptor::new()
+                    .tracer_provider(tracer_provider)
+                    .meter_provider(meter_provider)
             )
         )
     }
@@ -107,8 +108,9 @@ impl Setup {
             &[rule],
             move |config| config
                 .interceptor(
-                    BedrockInterceptor::with_tracer_provider(tracer_provider)
-                        .with_meter_provider(meter_provider)
+                    BedrockInterceptor::new()
+                        .tracer_provider(tracer_provider)
+                        .meter_provider(meter_provider)
                 )
                 .interceptor(FailAfterDeserialization)
         )
@@ -503,12 +505,14 @@ async fn two_interceptors_record_each_call_once() {
         &[&rule],
         move |config| config
             .interceptor(
-                BedrockInterceptor::with_tracer_provider(tracer_provider)
-                    .with_meter_provider(meter_provider)
+                BedrockInterceptor::new()
+                    .tracer_provider(tracer_provider)
+                    .meter_provider(meter_provider)
             )
             .interceptor(
-                BedrockInterceptor::with_tracer_provider(tracer_provider)
-                    .with_meter_provider(meter_provider)
+                BedrockInterceptor::new()
+                    .tracer_provider(tracer_provider)
+                    .meter_provider(meter_provider)
             )
     );
 
@@ -608,8 +612,9 @@ async fn the_same_interceptor_registered_twice_records_once() {
     let setup = Setup::new();
     let rule = stream_rule(three_chunk_stream());
     let shared = SharedInterceptor::new(
-        BedrockInterceptor::with_tracer_provider(&setup.tracer_provider)
-            .with_meter_provider(&setup.meter_provider),
+        BedrockInterceptor::new()
+            .tracer_provider(&setup.tracer_provider)
+            .meter_provider(&setup.meter_provider),
     );
     let client = mock_client!(
         aws_sdk_bedrockruntime,
@@ -650,4 +655,37 @@ async fn config_override_with_the_client_config_records_once() {
     while output.stream.recv().await.unwrap().is_some() {}
 
     assert_chunks_recorded_once(&setup);
+}
+
+#[tokio::test]
+async fn duration_matches_the_span() {
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
+    let spans = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(spans.clone())
+        .build();
+    let setup = Setup::new();
+    let rule = mock!(Client::converse).then_output(converse_output);
+    let meter_provider = &setup.meter_provider;
+    let client = mock_client!(
+        aws_sdk_bedrockruntime,
+        RuleMode::Sequential,
+        &[&rule],
+        |config| config.interceptor(
+            BedrockInterceptor::new()
+                .tracer_provider(&tracer_provider)
+                .meter_provider(meter_provider)
+        )
+    );
+
+    client.converse().model_id(MODEL).send().await.unwrap();
+
+    let span = spans.get_finished_spans().unwrap().remove(0);
+    let span_seconds = span
+        .end_time
+        .duration_since(span.start_time)
+        .unwrap()
+        .as_secs_f64();
+    // Equal, within the 100 ns resolution of `SystemTime` on Windows.
+    assert!((setup.point(DURATION).sum - span_seconds).abs() < 1e-6);
 }

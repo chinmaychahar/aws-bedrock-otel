@@ -283,7 +283,8 @@ impl ToolCall {
 
     fn finish(&mut self, error_type: Option<&str>) {
         self.ended = true;
-        // The span and the metric get the same duration.
+        // The span and the metric get the same duration. The end time follows the monotonic
+        // clock, so a wall clock change during the call doesn't move it.
         let duration = self.started.elapsed();
         let mut attributes = std::mem::take(&mut self.metric_attributes);
         if let Some(error_type) = error_type {
