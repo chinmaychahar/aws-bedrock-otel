@@ -9,6 +9,7 @@
 
 mod attributes;
 mod call;
+mod content;
 mod interceptor;
 mod metrics;
 mod stream;

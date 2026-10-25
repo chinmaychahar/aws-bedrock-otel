@@ -513,3 +513,37 @@ async fn unparseable_message_stop_is_recorded_as_other() {
         Some(Value::from("_OTHER"))
     );
 }
+
+#[tokio::test]
+async fn missing_token_counts_are_zero_like_the_sdk() {
+    let setup = Setup::new();
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        event("messageStop", r#"{"stopReason":"end_turn"}"#),
+        event(
+            "metadata",
+            r#"{"usage":{"outputTokens":null,"totalTokens":0},"metrics":{"latencyMs":1}}"#,
+        ),
+    ]);
+    let client = setup.client(&rule);
+    let mut output = client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+    drop(output);
+
+    let spans = setup.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(attribute(&spans[0], "error.type"), None);
+    assert_eq!(
+        attribute(&spans[0], "gen_ai.usage.input_tokens"),
+        Some(Value::I64(0))
+    );
+    assert_eq!(
+        attribute(&spans[0], "gen_ai.usage.output_tokens"),
+        Some(Value::I64(0))
+    );
+}

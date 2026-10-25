@@ -8,8 +8,10 @@ use opentelemetry::trace::{SpanRef, Status, TraceContextExt};
 use opentelemetry::{Context, KeyValue};
 
 use crate::attributes::{
-    AWS_REQUEST_ID, ERROR_TYPE, FINISH_REASON_ERROR, TokenUsage, finish_reasons, usage_attributes,
+    AWS_REQUEST_ID, ERROR_TYPE, FINISH_REASON_ERROR, GEN_AI_OUTPUT_MESSAGES, TokenUsage,
+    finish_reasons, usage_attributes,
 };
+use crate::content::ContentCapture;
 use crate::metrics::Metrics;
 
 /// A `Converse` or `ConverseStream` call. It is finished exactly once, by whichever part sees
@@ -19,6 +21,7 @@ pub(crate) struct Call {
     context: Context,
     started: Instant,
     metrics: Option<Metrics>,
+    capture: Option<ContentCapture>,
     metric_attributes: Vec<KeyValue>,
     /// `metric_attributes` plus the server attributes, once the endpoint is known.
     full_metric_attributes: OnceLock<Vec<KeyValue>>,
@@ -32,12 +35,14 @@ impl Call {
     pub(crate) fn new(
         context: Context,
         metrics: Option<Metrics>,
+        capture: Option<ContentCapture>,
         metric_attributes: Vec<KeyValue>,
     ) -> Self {
         Self {
             context,
             started: Instant::now(),
             metrics,
+            capture,
             metric_attributes,
             full_metric_attributes: OnceLock::new(),
             request_id: Mutex::new(None),
@@ -53,6 +58,23 @@ impl Call {
 
     pub(crate) fn started(&self) -> Instant {
         self.started
+    }
+
+    /// How to capture content, if capture is on.
+    pub(crate) fn capture(&self) -> Option<&ContentCapture> {
+        self.capture.as_ref()
+    }
+
+    /// Sets `gen_ai.output.messages` from `output`, if capture is on and the call hasn't
+    /// finished.
+    pub(crate) fn set_output(&self, output: impl FnOnce(&ContentCapture) -> Option<String>) {
+        if let Some(capture) = &self.capture
+            && !self.finished.load(Ordering::Acquire)
+            && let Some(output) = output(capture)
+        {
+            self.span()
+                .set_attribute(KeyValue::new(GEN_AI_OUTPUT_MESSAGES, output));
+        }
     }
 
     /// Records the endpoint of the first attempt on the span and metrics.

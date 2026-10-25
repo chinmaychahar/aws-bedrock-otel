@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::attributes::*;
 use crate::call::Call;
+use crate::content::StreamedMessage;
 
 /// Wraps a `ConverseStream` response body and ends the call when the stream finishes.
 pub(crate) struct TracedBody {
@@ -27,10 +28,14 @@ pub(crate) struct TracedBody {
 
 impl TracedBody {
     pub(crate) fn new(inner: SdkBody, call: Arc<Call>) -> Self {
+        let streamed = call
+            .capture()
+            .map(|capture| StreamedMessage::new(capture.max_length));
         Self {
             inner,
             recorder: Recorder {
                 call,
+                streamed,
                 usage: None,
                 stop_reason: None,
                 message_stopped: false,
@@ -96,6 +101,8 @@ impl Drop for TracedBody {
 
 struct Recorder {
     call: Arc<Call>,
+    /// The response message, when content capture is on.
+    streamed: Option<StreamedMessage>,
     usage: Option<TokenUsage>,
     stop_reason: Option<String>,
     message_stopped: bool,
@@ -133,7 +140,17 @@ impl Recorder {
     fn handle(&mut self, message: &Message) {
         match header(message, ":message-type") {
             Some("event") => match header(message, ":event-type") {
-                Some("contentBlockDelta") => self.record_chunk(),
+                Some("contentBlockStart") => {
+                    if let Some(streamed) = &mut self.streamed {
+                        streamed.start(message.payload());
+                    }
+                }
+                Some("contentBlockDelta") => {
+                    self.record_chunk();
+                    if let Some(streamed) = &mut self.streamed {
+                        streamed.delta(message.payload());
+                    }
+                }
                 Some("messageStop") => {
                     self.message_stopped = true;
                     match serde_json::from_slice::<MessageStop>(message.payload()) {
@@ -144,9 +161,10 @@ impl Recorder {
                 }
                 Some("metadata") => match serde_json::from_slice::<Metadata>(message.payload()) {
                     Ok(Metadata { usage }) => {
+                        // Like the SDK, missing counts are 0.
                         self.usage = usage.map(|usage| TokenUsage {
-                            input: usage.input_tokens,
-                            output: usage.output_tokens,
+                            input: usage.input_tokens.unwrap_or_default(),
+                            output: usage.output_tokens.unwrap_or_default(),
                             cache_read: usage.cache_read_input_tokens,
                             cache_write: usage.cache_write_input_tokens,
                         });
@@ -191,6 +209,11 @@ impl Recorder {
     fn finish(&mut self, error_type: Option<&str>) {
         self.decoding = false;
         if self.call.is_stream_delivered() {
+            // Output that was received is recorded, even if the stream failed.
+            if let Some(streamed) = self.streamed.take() {
+                self.call
+                    .set_output(|capture| streamed.output_messages(capture));
+            }
             self.call
                 .finish(self.usage.as_ref(), self.stop_reason.as_deref(), error_type);
         }
@@ -231,8 +254,8 @@ struct Metadata {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Usage {
-    input_tokens: i64,
-    output_tokens: i64,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
     cache_read_input_tokens: Option<i64>,
     cache_write_input_tokens: Option<i64>,
 }
@@ -270,6 +293,7 @@ mod tests {
         let span = provider.tracer("test").start("chat");
         let call = Arc::new(Call::new(
             Context::current_with_span(span),
+            None,
             None,
             Vec::new(),
         ));

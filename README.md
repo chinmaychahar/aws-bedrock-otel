@@ -86,6 +86,29 @@ Otherwise:
 - the exception name, such as `ModelStreamErrorException`, when Bedrock sends an exception in the stream
 - `_OTHER` when reading the stream fails, its framing, message type or event type is invalid, the `messageStop` or `metadata` event can't be parsed, it ends before `messageStop`, or another interceptor fails the call after the stream opened. Other events the SDK can't parse show up as `cancelled` when the caller drops the stream
 
+### Content capture
+
+Prompts and responses aren't recorded by default, because they can contain personal or sensitive data. Turn capture on with `.with_content_capture(true)`, or set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. The builder option overrides the environment variable. Content is recorded on spans, so it needs spans on.
+
+| Attribute | Content |
+|---|---|
+| `gen_ai.system_instructions` | system prompt |
+| `gen_ai.input.messages` | request messages, including tool calls and tool results |
+| `gen_ai.output.messages` | response message. For `ConverseStream`, rebuilt from the stream, including the part received before a stream fails or is dropped |
+| `gen_ai.tool.definitions` | the type and name of each tool |
+
+Values are JSON strings that follow the GenAI [message schemas](https://github.com/open-telemetry/semantic-conventions-genai). Images, documents, audio and video sent as bytes are recorded as their type and MIME type, without the bytes. Media in S3 is recorded with its S3 URI.
+
+Content isn't cut by default. The [X-Ray OTLP endpoint](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-OTLPEndpoint.html) rejects spans larger than 200 KB. Use `.with_max_content_length(bytes)` to cut each text, tool call argument and JSON tool result to that many bytes. Cut JSON values are recorded as strings. The limit applies to each value, not to the whole span, so a long conversation can still go over:
+
+```rust
+use aws_bedrock_otel::BedrockInterceptor;
+
+let interceptor = BedrockInterceptor::new()
+    .with_content_capture(true)
+    .with_max_content_length(16 * 1024);
+```
+
 ## Examples
 
 [`examples/stdout.rs`](examples/stdout.rs) sends one `Converse` request and prints the span and metrics to your terminal. It needs AWS credentials and access to the model:

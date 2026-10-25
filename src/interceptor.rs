@@ -12,6 +12,10 @@ use aws_sdk_bedrockruntime::operation::converse::{ConverseError, ConverseInput, 
 use aws_sdk_bedrockruntime::operation::converse_stream::{
     ConverseStreamError, ConverseStreamInput, ConverseStreamOutput,
 };
+use aws_sdk_bedrockruntime::types::{
+    ConverseOutput as ConverseResult, InferenceConfiguration, Message, OutputConfig,
+    SystemContentBlock, ToolConfiguration,
+};
 use aws_smithy_runtime_api::client::interceptors::context::Error;
 use aws_smithy_runtime_api::client::orchestrator::{HttpResponse, OrchestratorError};
 use aws_smithy_runtime_api::client::retries::RequestAttempts;
@@ -20,16 +24,18 @@ use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use aws_smithy_types::timeout::TimeoutConfig;
 use opentelemetry::global::{self, BoxedTracer};
 use opentelemetry::metrics::MeterProvider;
-use opentelemetry::trace::{SpanKind, TraceContextExt, Tracer, TracerProvider};
-use opentelemetry::{Context, InstrumentationScope};
+use opentelemetry::trace::{Span, SpanKind, TraceContextExt, Tracer, TracerProvider};
+use opentelemetry::{Context, InstrumentationScope, KeyValue};
 
 use crate::attributes::*;
 use crate::call::Call;
+use crate::content::{ContentCapture, tool_definitions};
 use crate::metrics::Metrics;
 use crate::stream::TracedBody;
 
 const SCOPE_NAME: &str = env!("CARGO_PKG_NAME");
 const SCOPE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CAPTURE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
 
 /// Records an OpenTelemetry span and metrics for each `Converse` and `ConverseStream` call made
 /// by a Bedrock Runtime client.
@@ -38,6 +44,10 @@ const SCOPE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `chat {model}`. A `ConverseStream` call ends when the response stream is read to the end or
 /// dropped. A call that is dropped before it finishes, for example by `tokio::time::timeout`, is
 /// recorded with `error.type` set to `cancelled`. Other operations are not traced yet.
+///
+/// Prompts and responses are not recorded unless
+/// [`with_content_capture`](Self::with_content_capture) or the
+/// `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` environment variable turns it on.
 ///
 /// Use [`without_spans`](Self::without_spans) or [`without_metrics`](Self::without_metrics) to
 /// record only one of them. Global providers are read when the interceptor is created, so set
@@ -64,6 +74,8 @@ pub struct BedrockInterceptor {
     metrics: Metrics,
     spans: bool,
     record_metrics: bool,
+    capture_content: bool,
+    max_content_length: Option<usize>,
 }
 
 impl BedrockInterceptor {
@@ -74,6 +86,9 @@ impl BedrockInterceptor {
             metrics: Metrics::new(&global::meter_with_scope(scope())),
             spans: true,
             record_metrics: true,
+            capture_content: std::env::var(CAPTURE_CONTENT_ENV)
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+            max_content_length: None,
         }
     }
 
@@ -109,6 +124,24 @@ impl BedrockInterceptor {
         self.record_metrics = false;
         self
     }
+
+    /// Records prompts, responses, system instructions and tool names on spans. This overrides
+    /// the `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` environment variable.
+    ///
+    /// Content may include personal or sensitive data. Media sent as bytes is recorded
+    /// without the bytes.
+    pub fn with_content_capture(mut self, enabled: bool) -> Self {
+        self.capture_content = enabled;
+        self
+    }
+
+    /// Cuts each captured text, tool call argument and JSON tool result to at most `bytes` bytes.
+    /// Cut JSON values are recorded as strings. The X-Ray OTLP endpoint rejects spans larger
+    /// than 200 KB.
+    pub fn with_max_content_length(mut self, bytes: usize) -> Self {
+        self.max_content_length = Some(bytes);
+        self
+    }
 }
 
 impl Default for BedrockInterceptor {
@@ -121,6 +154,60 @@ fn scope() -> InstrumentationScope {
     InstrumentationScope::builder(SCOPE_NAME)
         .with_version(SCOPE_VERSION)
         .build()
+}
+
+/// The parts of a `Converse` or `ConverseStream` input that are recorded.
+struct Request<'a> {
+    model: Option<&'a str>,
+    config: Option<&'a InferenceConfiguration>,
+    output_config: Option<&'a OutputConfig>,
+    guardrail: Option<&'a str>,
+    tool_config: Option<&'a ToolConfiguration>,
+    system: &'a [SystemContentBlock],
+    messages: &'a [Message],
+    streaming: bool,
+}
+
+impl<'a> Request<'a> {
+    fn from_converse(input: &'a ConverseInput) -> Self {
+        Self {
+            model: input.model_id(),
+            config: input.inference_config(),
+            output_config: input.output_config(),
+            guardrail: input.guardrail_config().map(|g| g.guardrail_identifier()),
+            tool_config: input.tool_config(),
+            system: input.system(),
+            messages: input.messages(),
+            streaming: false,
+        }
+    }
+
+    fn from_converse_stream(input: &'a ConverseStreamInput) -> Self {
+        Self {
+            model: input.model_id(),
+            config: input.inference_config(),
+            output_config: input.output_config(),
+            guardrail: input.guardrail_config().map(|g| g.guardrail_identifier()),
+            tool_config: input.tool_config(),
+            system: input.system(),
+            messages: input.messages(),
+            streaming: true,
+        }
+    }
+
+    fn content_attributes(&self, capture: &ContentCapture) -> Vec<KeyValue> {
+        [
+            (
+                GEN_AI_SYSTEM_INSTRUCTIONS,
+                capture.system_instructions(self.system),
+            ),
+            (GEN_AI_INPUT_MESSAGES, capture.input_messages(self.messages)),
+            (GEN_AI_TOOL_DEFINITIONS, tool_definitions(self.tool_config)),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| KeyValue::new(key, value)))
+        .collect()
+    }
 }
 
 /// The current call, kept in the request's config bag. If the request is dropped before the
@@ -176,49 +263,57 @@ impl Intercept for BedrockInterceptor {
         }
         // The typed input is only available before serialization.
         let input = context.input();
-        let (model, config, output_config, guardrail, streaming) =
-            if let Some(input) = input.downcast_ref::<ConverseInput>() {
-                let guardrail = input.guardrail_config().map(|g| g.guardrail_identifier());
-                (
-                    input.model_id(),
-                    input.inference_config(),
-                    input.output_config(),
-                    guardrail,
-                    false,
-                )
-            } else if let Some(input) = input.downcast_ref::<ConverseStreamInput>() {
-                let guardrail = input.guardrail_config().map(|g| g.guardrail_identifier());
-                (
-                    input.model_id(),
-                    input.inference_config(),
-                    input.output_config(),
-                    guardrail,
-                    true,
-                )
-            } else {
-                return Ok(());
-            };
+        let request = if let Some(input) = input.downcast_ref::<ConverseInput>() {
+            Request::from_converse(input)
+        } else if let Some(input) = input.downcast_ref::<ConverseStreamInput>() {
+            Request::from_converse_stream(input)
+        } else {
+            return Ok(());
+        };
+        let mut capture = None;
 
         // Without spans, an empty context makes every span operation a no-op, so the caller's
         // current span is never touched.
         let span_context = if self.spans {
-            let attributes = request_attributes(model, config, output_config, guardrail, streaming);
-            let span = self
+            let attributes = request_attributes(
+                request.model,
+                request.config,
+                request.output_config,
+                request.guardrail,
+                request.streaming,
+            );
+            let mut span = self
                 .tracer
-                .span_builder(format!("{OPERATION_CHAT} {}", model.unwrap_or_default()))
+                .span_builder(format!(
+                    "{OPERATION_CHAT} {}",
+                    request.model.unwrap_or_default()
+                ))
                 .with_kind(SpanKind::Client)
                 .with_attributes(attributes)
                 .start(&self.tracer);
+            // Content is only captured for spans that are recorded.
+            if self.capture_content && span.is_recording() {
+                let content = ContentCapture {
+                    max_length: self.max_content_length,
+                };
+                span.set_attributes(request.content_attributes(&content));
+                capture = Some(content);
+            }
             Context::current().with_span(span)
         } else {
             Context::new()
         };
 
         let metrics = self.record_metrics.then(|| self.metrics.clone());
-        let call = Call::new(span_context, metrics, metric_attributes(model));
+        let call = Call::new(
+            span_context,
+            metrics,
+            capture,
+            metric_attributes(request.model),
+        );
         cfg.interceptor_state().store_put(CallState {
             call: Arc::new(call),
-            streaming,
+            streaming: request.streaming,
             operation_timeout: None,
             wrapped_attempt: None,
         });
@@ -311,6 +406,9 @@ impl Intercept for BedrockInterceptor {
                 if output.downcast_ref::<ConverseStreamOutput>().is_some() {
                     call.deliver_stream();
                 } else if let Some(output) = output.downcast_ref::<ConverseOutput>() {
+                    if let Some(ConverseResult::Message(message)) = output.output() {
+                        call.set_output(|capture| Some(capture.output_messages(message)));
+                    }
                     let usage = output.usage().map(|usage| TokenUsage {
                         input: i64::from(usage.input_tokens()),
                         output: i64::from(usage.output_tokens()),

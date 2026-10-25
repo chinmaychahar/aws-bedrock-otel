@@ -10,6 +10,8 @@
 - `BedrockInterceptor::with_meter_provider` to record metrics with a given meter provider. The global meter provider is used otherwise.
 - `BedrockInterceptor::without_spans` and `BedrockInterceptor::without_metrics` to record only metrics or only spans.
 - Span attributes `server.address`, `server.port`, `aws.request_id`, `gen_ai.output.type` and `gen_ai.request.reasoning.level`. Metrics also have `server.address` and `server.port`.
+- Opt-in content capture with `BedrockInterceptor::with_content_capture` or `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`: `gen_ai.system_instructions`, `gen_ai.input.messages`, `gen_ai.output.messages` and `gen_ai.tool.definitions`, including tool calls, tool results and reasoning. Streamed responses are rebuilt from their events.
+- `BedrockInterceptor::with_max_content_length` to cut each captured text, tool call argument and JSON tool result to a number of bytes. Cut JSON values are recorded as strings.
 
 ### Changed
 
