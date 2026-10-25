@@ -1,16 +1,19 @@
+mod common;
+
 use aws_bedrock_otel::BedrockInterceptor;
 use aws_sdk_bedrockruntime::Client;
+use aws_sdk_bedrockruntime::config::interceptors::FinalizerInterceptorContextRef;
+use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
+use aws_sdk_bedrockruntime::error::BoxError;
 use aws_sdk_bedrockruntime::error::ErrorMetadata;
 use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
 use aws_sdk_bedrockruntime::types::error::ValidationException;
-use aws_smithy_eventstream::frame::write_message_to;
 use aws_smithy_mocks::{Rule, RuleMode, mock, mock_client};
-use aws_smithy_runtime_api::http::{Response, StatusCode};
-use aws_smithy_types::body::SdkBody;
-use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
 use opentelemetry::trace::Status;
 use opentelemetry::{Array, StringValue, Value};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
+
+use common::{event, exception, full_stream, stream_rule};
 
 struct Setup {
     provider: SdkTracerProvider,
@@ -41,69 +44,17 @@ impl Setup {
     }
 }
 
+fn strings(values: &[&'static str]) -> Value {
+    Value::Array(Array::String(
+        values.iter().map(|v| StringValue::from(*v)).collect(),
+    ))
+}
+
 fn attribute(span: &SpanData, key: &str) -> Option<Value> {
     span.attributes
         .iter()
         .find(|kv| kv.key.as_str() == key)
         .map(|kv| kv.value.clone())
-}
-
-fn message(
-    message_type: &'static str,
-    type_header: &'static str,
-    name: &str,
-    payload: &str,
-) -> Message {
-    Message::new(payload.as_bytes().to_vec())
-        .add_header(Header::new(
-            ":message-type",
-            HeaderValue::String(message_type.into()),
-        ))
-        .add_header(Header::new(
-            type_header,
-            HeaderValue::String(name.to_owned().into()),
-        ))
-        .add_header(Header::new(
-            ":content-type",
-            HeaderValue::String("application/json".into()),
-        ))
-}
-
-fn event(name: &str, payload: &str) -> Message {
-    message("event", ":event-type", name, payload)
-}
-
-fn stream_rule(messages: Vec<Message>) -> Rule {
-    let mut body = Vec::new();
-    for message in &messages {
-        write_message_to(message, &mut body).unwrap();
-    }
-    mock!(Client::converse_stream).then_http_response(move || {
-        let mut response = Response::new(
-            StatusCode::try_from(200).unwrap(),
-            SdkBody::from(body.clone()),
-        );
-        response
-            .headers_mut()
-            .insert("content-type", "application/vnd.amazon.eventstream");
-        response
-    })
-}
-
-fn full_stream() -> Vec<Message> {
-    vec![
-        event("messageStart", r#"{"role":"assistant"}"#),
-        event(
-            "contentBlockDelta",
-            r#"{"contentBlockIndex":0,"delta":{"text":"Hello"}}"#,
-        ),
-        event("contentBlockStop", r#"{"contentBlockIndex":0}"#),
-        event("messageStop", r#"{"stopReason":"end_turn"}"#),
-        event(
-            "metadata",
-            r#"{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":20,"cacheReadInputTokens":3,"cacheWriteInputTokens":2},"metrics":{"latencyMs":100}}"#,
-        ),
-    ]
 }
 
 #[tokio::test]
@@ -188,12 +139,7 @@ async fn records_error_from_stream_exception() {
     let setup = Setup::new();
     let rule = stream_rule(vec![
         event("messageStart", r#"{"role":"assistant"}"#),
-        message(
-            "exception",
-            ":exception-type",
-            "modelStreamErrorException",
-            r#"{"message":"model failed"}"#,
-        ),
+        exception("modelStreamErrorException"),
     ]);
     let client = setup.client(&rule);
 
@@ -214,6 +160,10 @@ async fn records_error_from_stream_exception() {
         Some(Value::from("ModelStreamErrorException"))
     );
     assert_eq!(spans[0].status, Status::error("ModelStreamErrorException"));
+    assert_eq!(
+        attribute(&spans[0], "gen_ai.response.finish_reasons"),
+        Some(strings(&["error"]))
+    );
 }
 
 #[tokio::test]
@@ -241,4 +191,113 @@ async fn records_error_before_stream_opens() {
         attribute(&spans[0], "error.type"),
         Some(Value::from("ValidationException"))
     );
+}
+
+#[tokio::test]
+async fn span_is_cancelled_when_stream_is_dropped_before_its_final_event() {
+    let setup = Setup::new();
+    let rule = stream_rule(vec![
+        event("messageStart", r#"{"role":"assistant"}"#),
+        event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"Hel"}}"#,
+        ),
+    ]);
+    let client = setup.client(&rule);
+
+    let mut output = client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+    output.stream.recv().await.unwrap();
+    drop(output);
+
+    let spans = setup.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attribute(&spans[0], "error.type"),
+        Some(Value::from("cancelled"))
+    );
+    assert_eq!(spans[0].status, Status::error("cancelled"));
+    assert_eq!(
+        attribute(&spans[0], "gen_ai.response.finish_reasons"),
+        Some(strings(&["error"]))
+    );
+}
+
+/// Fails every call in `read_after_execution`, after the stream has been handed over.
+#[derive(Debug)]
+struct FailAfterExecution;
+
+impl Intercept for FailAfterExecution {
+    fn name(&self) -> &'static str {
+        "FailAfterExecution"
+    }
+
+    fn read_after_execution(
+        &self,
+        _context: &FinalizerInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        Err("failed".into())
+    }
+}
+
+#[tokio::test]
+async fn stream_failed_by_another_interceptor_is_an_error() {
+    let setup = Setup::new();
+    let rule = stream_rule(full_stream());
+    let provider = &setup.provider;
+    let client = mock_client!(
+        aws_sdk_bedrockruntime,
+        RuleMode::Sequential,
+        &[&rule],
+        move |config| config
+            .interceptor(BedrockInterceptor::with_tracer_provider(provider))
+            .interceptor(FailAfterExecution)
+    );
+
+    client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap_err();
+
+    let spans = setup.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attribute(&spans[0], "error.type"),
+        Some(Value::from("_OTHER"))
+    );
+}
+
+#[tokio::test]
+async fn registering_the_interceptor_twice_records_one_span() {
+    let setup = Setup::new();
+    let rule = stream_rule(full_stream());
+    let provider = &setup.provider;
+    let client = mock_client!(
+        aws_sdk_bedrockruntime,
+        RuleMode::Sequential,
+        &[&rule],
+        move |config| config
+            .interceptor(BedrockInterceptor::with_tracer_provider(provider))
+            .interceptor(BedrockInterceptor::with_tracer_provider(provider))
+    );
+
+    let mut output = client
+        .converse_stream()
+        .model_id("amazon.nova-lite")
+        .send()
+        .await
+        .unwrap();
+    while output.stream.recv().await.unwrap().is_some() {}
+
+    let spans = setup.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(attribute(&spans[0], "error.type"), None);
 }

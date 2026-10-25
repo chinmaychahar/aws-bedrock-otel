@@ -1,17 +1,19 @@
+mod common;
+
 use aws_bedrock_otel::BedrockInterceptor;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::error::ErrorMetadata;
-use aws_sdk_bedrockruntime::operation::converse::{ConverseError, ConverseOutput};
+use aws_sdk_bedrockruntime::operation::converse::ConverseError;
 use aws_sdk_bedrockruntime::types::error::ValidationException;
-use aws_sdk_bedrockruntime::types::{
-    ConverseMetrics, GuardrailConfiguration, InferenceConfiguration, StopReason, TokenUsage,
-};
+use aws_sdk_bedrockruntime::types::{GuardrailConfiguration, InferenceConfiguration};
 use aws_smithy_mocks::{Rule, RuleMode, mock, mock_client};
 use opentelemetry::trace::{
     FutureExt, SpanKind, Status, TraceContextExt, Tracer, TracerProvider as _,
 };
 use opentelemetry::{Array, Context, KeyValue, StringValue, Value};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
+
+use common::converse_output;
 
 struct Setup {
     provider: SdkTracerProvider,
@@ -55,24 +57,6 @@ fn strings(values: &[&'static str]) -> Value {
     Value::Array(Array::String(
         values.iter().map(|v| StringValue::from(*v)).collect(),
     ))
-}
-
-fn converse_output() -> ConverseOutput {
-    ConverseOutput::builder()
-        .stop_reason(StopReason::EndTurn)
-        .usage(
-            TokenUsage::builder()
-                .input_tokens(10)
-                .output_tokens(5)
-                .total_tokens(20)
-                .cache_read_input_tokens(3)
-                .cache_write_input_tokens(2)
-                .build()
-                .unwrap(),
-        )
-        .metrics(ConverseMetrics::builder().latency_ms(1).build().unwrap())
-        .build()
-        .unwrap()
 }
 
 #[tokio::test]
@@ -185,6 +169,10 @@ async fn records_error_type() {
         Some(Value::from("ValidationException"))
     );
     assert_eq!(span.status, Status::error("ValidationException"));
+    assert_eq!(
+        attribute(&span, "gen_ai.response.finish_reasons"),
+        Some(strings(&["error"]))
+    );
     assert_eq!(attribute(&span, "gen_ai.usage.input_tokens"), None);
 }
 

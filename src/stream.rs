@@ -1,9 +1,10 @@
 //! Tracing for `ConverseStream` responses.
 //!
-//! The span is ended by the response body, which reads the stop reason and token usage from the
-//! stream events as they pass through.
+//! The response body ends the call. It reads the stop reason, token usage and chunk timings from
+//! the stream events as they pass through.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
@@ -12,30 +13,31 @@ use aws_smithy_types::body::{Error as BodyError, SdkBody};
 use aws_smithy_types::event_stream::{HeaderValue, Message};
 use bytes::{Bytes, BytesMut};
 use http_body::{Body, Frame, SizeHint};
-use opentelemetry::trace::{Status, TraceContextExt};
-use opentelemetry::{Context, KeyValue};
+use opentelemetry::KeyValue;
 use serde::Deserialize;
 
 use crate::attributes::*;
+use crate::call::Call;
 
-/// Wraps a `ConverseStream` response body and ends the span when the stream finishes.
+/// Wraps a `ConverseStream` response body and ends the call when the stream finishes.
 pub(crate) struct TracedBody {
     inner: SdkBody,
     recorder: Recorder,
 }
 
 impl TracedBody {
-    pub(crate) fn new(inner: SdkBody, span_context: Context, started: Instant) -> Self {
+    pub(crate) fn new(inner: SdkBody, call: Arc<Call>) -> Self {
         Self {
             inner,
             recorder: Recorder {
-                span_context,
-                started,
+                call,
+                usage: None,
+                stop_reason: None,
+                message_stopped: false,
+                last_chunk: None,
                 decoder: MessageFrameDecoder::new(),
                 buffer: BytesMut::new(),
                 decoding: true,
-                first_chunk_seen: false,
-                ended: false,
             },
         }
     }
@@ -57,8 +59,8 @@ impl Body for TracedBody {
                     this.recorder.observe(data);
                 }
             }
-            Poll::Ready(Some(Err(_))) => this.recorder.end_with_error(ERROR_TYPE_OTHER),
-            Poll::Ready(None) => this.recorder.end(),
+            Poll::Ready(Some(Err(_))) => this.recorder.finish(Some(ERROR_TYPE_OTHER)),
+            Poll::Ready(None) => this.recorder.finish(None),
             Poll::Pending => {}
         }
         poll
@@ -75,24 +77,33 @@ impl Body for TracedBody {
 
 impl Drop for TracedBody {
     fn drop(&mut self) {
-        // The stream may be dropped before it is read to the end.
-        self.recorder.end();
+        let error_type = if self.recorder.message_stopped {
+            None
+        } else if self.recorder.call.is_request_done() {
+            // The caller dropped the stream before the message ended.
+            Some(ERROR_TYPE_CANCELLED)
+        } else {
+            // The request failed after the stream was opened, e.g. in another interceptor.
+            Some(ERROR_TYPE_OTHER)
+        };
+        self.recorder.finish(error_type);
     }
 }
 
 struct Recorder {
-    span_context: Context,
-    started: Instant,
+    call: Arc<Call>,
+    usage: Option<TokenUsage>,
+    stop_reason: Option<String>,
+    message_stopped: bool,
+    last_chunk: Option<Instant>,
     decoder: MessageFrameDecoder,
     buffer: BytesMut,
     decoding: bool,
-    first_chunk_seen: bool,
-    ended: bool,
 }
 
 impl Recorder {
     fn observe(&mut self, data: &Bytes) {
-        if !self.decoding || self.ended {
+        if !self.decoding {
             return;
         }
         self.buffer.extend_from_slice(data);
@@ -111,34 +122,27 @@ impl Recorder {
     }
 
     fn handle(&mut self, message: &Message) {
-        let span = self.span_context.span();
         match header(message, ":message-type") {
             Some("event") => match header(message, ":event-type") {
-                Some("contentBlockDelta") if !self.first_chunk_seen => {
-                    self.first_chunk_seen = true;
-                    span.set_attribute(KeyValue::new(
-                        GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
-                        self.started.elapsed().as_secs_f64(),
-                    ));
-                }
+                Some("contentBlockDelta") => self.record_chunk(),
                 Some("messageStop") => {
-                    if let Ok(MessageStop {
-                        stop_reason: Some(reason),
-                    }) = serde_json::from_slice(message.payload())
+                    self.message_stopped = true;
+                    if let Ok(MessageStop { stop_reason }) =
+                        serde_json::from_slice(message.payload())
                     {
-                        span.set_attribute(finish_reasons(&reason));
+                        self.stop_reason = stop_reason;
                     }
                 }
                 Some("metadata") => {
                     if let Ok(Metadata { usage: Some(usage) }) =
                         serde_json::from_slice(message.payload())
                     {
-                        span.set_attributes(usage_attributes(
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            usage.cache_read_input_tokens,
-                            usage.cache_write_input_tokens,
-                        ));
+                        self.usage = Some(TokenUsage {
+                            input: usage.input_tokens,
+                            output: usage.output_tokens,
+                            cache_read: usage.cache_read_input_tokens,
+                            cache_write: usage.cache_write_input_tokens,
+                        });
                     }
                 }
                 _ => {}
@@ -147,26 +151,36 @@ impl Recorder {
                 let error_type = header(message, ":exception-type")
                     .map(capitalize)
                     .unwrap_or_else(|| ERROR_TYPE_OTHER.to_owned());
-                self.end_with_error(&error_type);
+                self.finish(Some(&error_type));
             }
             _ => {}
         }
     }
 
-    fn end_with_error(&mut self, error_type: &str) {
-        if self.ended {
-            return;
+    fn record_chunk(&mut self) {
+        let now = Instant::now();
+        match self.last_chunk {
+            None => {
+                let elapsed = now.duration_since(self.call.started());
+                self.call.span().set_attribute(KeyValue::new(
+                    GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
+                    elapsed.as_secs_f64(),
+                ));
+                self.call.record_time_to_first_chunk(elapsed);
+            }
+            Some(previous) => self
+                .call
+                .record_time_per_output_chunk(now.duration_since(previous)),
         }
-        let span = self.span_context.span();
-        span.set_attribute(KeyValue::new(ERROR_TYPE, error_type.to_owned()));
-        span.set_status(Status::error(error_type.to_owned()));
-        self.end();
+        self.last_chunk = Some(now);
     }
 
-    fn end(&mut self) {
-        if !self.ended {
-            self.ended = true;
-            self.span_context.span().end();
+    /// Ends the call, unless the stream never reached the caller. In that case the request
+    /// failed and the interceptor ends the call.
+    fn finish(&mut self, error_type: Option<&str>) {
+        if self.call.is_stream_delivered() {
+            self.call
+                .finish(self.usage.as_ref(), self.stop_reason.as_deref(), error_type);
         }
     }
 }
@@ -216,7 +230,8 @@ mod tests {
     use super::*;
     use aws_smithy_eventstream::frame::write_message_to;
     use aws_smithy_types::event_stream::Header;
-    use opentelemetry::trace::{Tracer, TracerProvider};
+    use opentelemetry::Context;
+    use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider};
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 
     fn event(name: &str, payload: &str) -> Vec<u8> {
@@ -241,11 +256,13 @@ mod tests {
             .with_simple_exporter(exporter.clone())
             .build();
         let span = provider.tracer("test").start("chat");
-        let mut body = TracedBody::new(
-            SdkBody::empty(),
+        let call = Arc::new(Call::new(
             Context::current_with_span(span),
-            Instant::now(),
-        );
+            None,
+            Vec::new(),
+        ));
+        call.deliver_stream();
+        let mut body = TracedBody::new(SdkBody::empty(), call);
 
         let mut bytes = event("messageStop", r#"{"stopReason":"max_tokens"}"#);
         bytes.extend(event(

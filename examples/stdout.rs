@@ -1,4 +1,5 @@
-//! Sends one `Converse` request to Amazon Bedrock and prints the recorded span to stdout.
+//! Sends one `Converse` request to Amazon Bedrock and prints the recorded span and metrics to
+//! stdout.
 //!
 //! Needs AWS credentials and access to the model in your region:
 //!
@@ -10,17 +11,26 @@ use aws_bedrock_otel::BedrockInterceptor;
 use aws_sdk_bedrockruntime::types::{
     ContentBlock, ConversationRole, InferenceConfiguration, Message,
 };
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let provider = SdkTracerProvider::builder()
+    let tracer_provider = SdkTracerProvider::builder()
         .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
+        .build();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_reader(
+            PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default()).build(),
+        )
         .build();
 
     let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
-        .interceptor(BedrockInterceptor::with_tracer_provider(&provider))
+        .interceptor(
+            BedrockInterceptor::with_tracer_provider(&tracer_provider)
+                .with_meter_provider(&meter_provider),
+        )
         .build();
     let client = aws_sdk_bedrockruntime::Client::from_conf(config);
 
@@ -50,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    provider.shutdown()?;
+    tracer_provider.shutdown()?;
+    meter_provider.shutdown()?;
     Ok(())
 }
