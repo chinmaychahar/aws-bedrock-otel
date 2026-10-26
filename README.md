@@ -5,13 +5,13 @@
 [![CI](https://github.com/chinmaychahar/aws-bedrock-otel/actions/workflows/ci.yml/badge.svg)](https://github.com/chinmaychahar/aws-bedrock-otel/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/aws-bedrock-otel.svg)](LICENSE)
 
-OpenTelemetry tracing and metrics for Rust apps that use the official [`aws-sdk-bedrockruntime`](https://docs.rs/aws-sdk-bedrockruntime) client. Add one interceptor and your Bedrock calls are recorded as spans and metrics following the OpenTelemetry [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai).
+OpenTelemetry traces and metrics for Amazon Bedrock calls made with the official [`aws-sdk-bedrockruntime`](https://docs.rs/aws-sdk-bedrockruntime) Rust client.
 
-> **Status:** early development. `Converse` and `ConverseStream` calls are traced, `InvokeModel` is WIP
+Add one interceptor to your client. Every `Converse` and `ConverseStream` call is then recorded with its model, settings, token usage, latency and errors, following the OpenTelemetry [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai).
 
-## Usage
+> **Status:** early development. `Converse` and `ConverseStream` are supported. `InvokeModel` is not yet.
 
-Add `BedrockInterceptor` to your Bedrock Runtime client:
+## Quick start
 
 ```rust
 use aws_bedrock_otel::BedrockInterceptor;
@@ -23,133 +23,168 @@ let config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
 let client = aws_sdk_bedrockruntime::Client::from_conf(config);
 ```
 
-Notes:
-- `BedrockInterceptor::new()` uses the global tracer and meter providers. They are read when the interceptor is created, so set them first. Use `BedrockInterceptor::new().tracer_provider(&tracer_provider)` and `.meter_provider(&meter_provider)` to pass them explicitly
-- `.spans(false)` records metrics only, for apps where another library (such as Rig) already creates spans for these calls. `.metrics(false)` records spans only
-- Add one `BedrockInterceptor` per client. If there are several, the first one to see a call traces it, and each call is still recorded once. Client-level interceptors see calls before ones added with `customize()`, so a `customize()` interceptor is ignored when the client already has one
-- A `ConverseStream` call ends when the response stream is read to the end or dropped. A stream dropped before `messageStop`, or a call dropped before it finishes (for example by `tokio::time::timeout`), is recorded with `error.type` set to `cancelled`
-- Bedrock sends token usage in the last stream event, after `messageStop`. Read the stream to the end to record it
-- Durations start when the call starts, so they include signing, retries and the waits between them
-- Streams are timed as the caller reads them, so a slow reader adds to the durations. Chunks that arrive together are recorded close together
-- Each `Converse` and `ConverseStream` call records a `chat {model}` span with the attributes below. Tool calls that the app runs can be recorded too, see [Tool calls](#tool-calls)
+That's it. Each call now creates a `chat {model}` span and records metrics. Set up your OpenTelemetry tracer and meter providers before creating the interceptor.
 
-### With `tracing`
+## What you get
 
-With [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) 0.34 (the release for `opentelemetry` 0.33), spans join the trace of the current `tracing` span. This relies on the layer's `with_context_activation`, which is on by default. If the SDK's own debug spans are enabled, the `chat` span appears under one of them instead of directly under your span.
+- **Spans** with the model, request settings, token usage, finish reason, endpoint and AWS request ID
+- **Metrics** for call duration, token usage and, for streams, time to first chunk and time per chunk
+- **Errors** recorded with a clear `error.type`, including timeouts and cancelled calls
+- **Streaming** handled correctly: the span ends when you finish reading the stream
+- **Prompts and responses**, if you turn content capture on
+- **Tool calls** your app runs, with `ToolTracer`
 
-### Spans
-
-
-| Attribute | Source |
-|---|---|
-| `gen_ai.operation.name` | `chat` |
-| `gen_ai.provider.name` | `aws.bedrock` |
-| `gen_ai.request.model` | model ID |
-| `gen_ai.request.max_tokens`, `gen_ai.request.temperature`, `gen_ai.request.top_p`, `gen_ai.request.stop_sequences` | inference configuration, when set |
-| `aws.bedrock.guardrail.id` | guardrail configuration, when set |
-| `gen_ai.output.type` | `json` when a JSON schema output format is requested |
-| `gen_ai.request.reasoning.level` | output configuration `effort`, when set. Reasoning set in `additionalModelRequestFields` is not recorded |
-| `server.address`, `server.port` | endpoint the request is sent to. Added after the span starts, so samplers don't see them |
-| `aws.request_id` | AWS request ID of the latest attempt that got a response (an AWS SDK attribute, not a GenAI one) |
-| `gen_ai.request.stream` | `true` for `ConverseStream` |
-| `gen_ai.response.finish_reasons` | stop reason, or `error` when the call fails before one is received |
-| `gen_ai.response.time_to_first_chunk` | seconds until the first content chunk, for `ConverseStream` |
-| `gen_ai.usage.input_tokens` | input tokens, including cache reads and writes |
-| `gen_ai.usage.output_tokens` | output tokens |
-| `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | cached tokens, when reported |
-| `error.type` | see below, when the call or the stream fails |
-
-### Metrics
-
-| Metric | Type | Recorded |
-|---|---|---|
-| `gen_ai.client.inference.duration` | histogram, seconds | for every call, including failed and cancelled calls |
-| `gen_ai.client.inference.time_to_first_chunk` | histogram, seconds | for `ConverseStream`, when the first content chunk arrives |
-| `gen_ai.client.inference.time_per_output_chunk` | histogram, seconds | for `ConverseStream`, for each content chunk after the first |
-| `gen_ai.client.inference.operation.input_tokens`, `gen_ai.client.inference.operation.output_tokens` | histograms, tokens | for every call; `0` when there is no usage |
-| `gen_ai.client.inference.usage.input_tokens`, `.output_tokens`, `.cache_read.input_tokens`, `.cache_write.input_tokens` | counters, tokens | when the count is above `0` |
-
-Metrics have `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `server.address` and `server.port`. Durations and token histograms also have `error.type` when the call fails, and the usage counters have `gen_ai.token.modality` set to `unknown`.
-
-### Errors
-
-When the interceptor sees the SDK's error, `error.type` is the first of these that applies:
-
-1. the Bedrock error code, such as `ThrottlingException` or `ValidationException`
-2. `timeout`, for SDK attempt timeouts and connection timeouts
-3. the HTTP status code, such as `400`, when the error has no code
-4. `_OTHER`
-
-Otherwise:
-
-- `timeout` when the SDK's operation timeout ends the call
-- `cancelled` when the call is dropped before it returns, or its stream is dropped before `messageStop`
-- the exception name, such as `ModelStreamErrorException`, when Bedrock sends an exception in the stream
-- `_OTHER` when reading the stream fails, its framing, message type or event type is invalid, the `messageStop` or `metadata` event can't be parsed, it ends before `messageStop`, or another interceptor fails the call after the stream opened. Other events the SDK can't parse show up as `cancelled` when the caller drops the stream
-
-### Content capture
-
-Prompts and responses aren't recorded by default, because they can contain personal or sensitive data. Turn capture on with `.content_capture(true)`, or set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. The builder option overrides the environment variable. Content is recorded on spans, so it needs spans on.
-
-| Attribute | Content |
-|---|---|
-| `gen_ai.system_instructions` | system prompt |
-| `gen_ai.input.messages` | request messages, including tool calls and tool results |
-| `gen_ai.output.messages` | response message. For `ConverseStream`, rebuilt from the stream, including the part received before a stream fails or is dropped |
-| `gen_ai.tool.definitions` | the type and name of each tool |
-
-Values are JSON strings that follow the GenAI [message schemas](https://github.com/open-telemetry/semantic-conventions-genai). Images, documents, audio and video sent as bytes are recorded as their type and MIME type, without the bytes. Media in S3 is recorded with its S3 URI. Tools that Bedrock runs itself are recorded as `server_tool_call` and `server_tool_call_response` parts. Messages keep the roles Bedrock uses, so the results of the app's tools are in `user` messages.
-
-Content isn't cut by default. The [X-Ray OTLP endpoint](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-OTLPEndpoint.html) rejects spans larger than 200 KB. Use `.max_content_length(bytes)` to cut each text, tool call argument and JSON tool result to that many bytes. Cut JSON values are recorded as strings. The limit applies to each value, not to the whole span, so a long conversation can still go over:
+## Options
 
 ```rust
-use aws_bedrock_otel::BedrockInterceptor;
-
 let interceptor = BedrockInterceptor::new()
-    .content_capture(true)
-    .max_content_length(16 * 1024);
+    .tracer_provider(&tracer_provider) // default: the global tracer provider
+    .meter_provider(&meter_provider)   // default: the global meter provider
+    .spans(false)                      // turn spans off, keep metrics
+    .metrics(false)                    // turn metrics off, keep spans
+    .content_capture(true)             // record prompts and responses (off by default)
+    .max_content_length(16 * 1024);    // cut each captured text to 16 KB
 ```
 
-### Tool calls
+Use `.spans(false)` if another library, such as Rig, already creates spans for these calls.
 
-When the model asks for a tool, the app runs it. `tool_tracer()` returns a `ToolTracer` that records each of those calls as an `execute_tool {tool}` span and in the `gen_ai.execute_tool.duration` histogram. It uses the interceptor's providers and options, so call it after setting them:
+## Streaming
+
+- The call ends when you read the stream to the end, or drop it.
+- Read the stream to the end to get token usage. Bedrock sends it in the last event.
+- If you drop the stream early, the call is recorded as `cancelled`.
+
+## Content capture
+
+Prompts and responses can contain personal data, so they aren't recorded unless you turn this on:
 
 ```rust
-use aws_bedrock_otel::BedrockInterceptor;
-use aws_sdk_bedrockruntime::types::ContentBlock;
+let interceptor = BedrockInterceptor::new().content_capture(true);
+```
 
+You can also set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. The builder option wins over the environment variable.
+
+When on, spans get:
+
+| Attribute | Contains |
+|---|---|
+| `gen_ai.system_instructions` | the system prompt |
+| `gen_ai.input.messages` | the request messages |
+| `gen_ai.output.messages` | the response (for streams, everything received) |
+| `gen_ai.tool.definitions` | the type and name of each tool |
+
+Good to know:
+
+- Images, documents, audio and video are never recorded as bytes. Only their type is kept, or their S3 URI.
+- The X-Ray OTLP endpoint [rejects spans over 200 KB](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-OTLPEndpoint.html). Use `.max_content_length(bytes)` to cut long texts. The limit applies to each text, not the whole span.
+
+## Tool calls
+
+When the model asks for a tool, your app runs it. `ToolTracer` records each of those runs as an `execute_tool {tool}` span:
+
+```rust
 let interceptor = BedrockInterceptor::new();
-let tools = interceptor.tool_tracer();
-// Add `interceptor` to the client, then for each tool call in a response:
+let tools = interceptor.tool_tracer(); // after setting the interceptor's options
+
 for block in message.content() {
     if let ContentBlock::ToolUse(tool_use) = block {
         let call = tools.tool_use(tool_use).start();
-        let result = call.in_context(run_tool(tool_use)).await; // a `ToolResultBlock`
+        let result = call.in_context(run_tool(tool_use)).await;
         call.end_with_result(&result);
     }
 }
 ```
 
-- `tool_use()` records the tool's name, `gen_ai.tool.call.id` and `gen_ai.tool.type` set to `function`. For other tools, use `tools.tool(name)` and set what applies: `.call_id()`, `.tool_type()`, `.description()`, `.agent_name()`, `.conversation_id()` and `.arguments()`
-- End a call with `.end_with_result(&result)`, `.end()` without a result, or `.fail(error_type)`. A result with the status `error` is recorded with `error.type` set to `_OTHER`; use `.fail()` for another error type. A call dropped before it ends is recorded with `error.type` set to `cancelled`, or `_OTHER` if a panic in the tool drops it
-- With content capture on, the arguments and the result of successful calls are recorded as `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result`. The conventions expect JSON objects. A JSON result, or a text result that holds a JSON object, is recorded as that object. Other text is recorded as a JSON string, and several blocks as an array. Empty results aren't recorded
-- Spans start as children of the current context. `call.in_context(future)` and `call.attach()` make spans started by the tool children of its call. In async code, use `in_context`. This includes `tracing` spans, as long as they are created inside, not before: `call.in_context(work.instrument(span))` creates `span` first, so it isn't a child. `tracing` spans rely on the layer's context activation, as in [With `tracing`](#with-tracing)
-- The metric has `gen_ai.tool.name`, and `gen_ai.tool.type`, `gen_ai.agent.name` and `error.type` when set. Its value is the span's duration
+- End a call with `end_with_result(&result)`, `end()` or `fail("error type")`.
+- A call dropped without ending is recorded as `cancelled`, or `_OTHER` if the tool panicked.
+- `in_context` makes spans created by the tool children of its call.
+- For tools that don't come from a `ToolUseBlock`, use `tools.tool("name")`.
+
+## Using `tracing`
+
+With [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) 0.34, Bedrock spans appear under your current `tracing` span. No extra setup is needed.
+
+## Errors
+
+`error.type` is set when a call fails:
+
+| Value | When |
+|---|---|
+| Bedrock error code, such as `ThrottlingException` | Bedrock returned an error |
+| `timeout` | an SDK timeout ended the call |
+| HTTP status, such as `503` | the error had no code |
+| exception name, such as `ModelStreamErrorException` | Bedrock sent an error inside the stream |
+| `cancelled` | the call or its stream was dropped before it finished |
+| `_OTHER` | anything else, such as a broken stream |
+
+## Reference
+
+<details>
+<summary>Span attributes</summary>
+
+| Attribute | Value |
+|---|---|
+| `gen_ai.operation.name` | `chat` |
+| `gen_ai.provider.name` | `aws.bedrock` |
+| `gen_ai.request.model` | model ID |
+| `gen_ai.request.max_tokens`, `.temperature`, `.top_p`, `.stop_sequences` | inference settings, when set |
+| `gen_ai.request.reasoning.level` | output configuration `effort`, when set |
+| `gen_ai.request.stream` | `true` for `ConverseStream` |
+| `gen_ai.output.type` | `json` when a JSON schema output is requested |
+| `aws.bedrock.guardrail.id` | guardrail, when set |
+| `server.address`, `server.port` | the endpoint |
+| `aws.request_id` | AWS request ID of the last attempt |
+| `gen_ai.response.finish_reasons` | stop reason, or `error` |
+| `gen_ai.response.time_to_first_chunk` | seconds to the first chunk, for streams |
+| `gen_ai.usage.input_tokens` | input tokens, including cached tokens |
+| `gen_ai.usage.output_tokens` | output tokens |
+| `gen_ai.usage.cache_read.input_tokens`, `.cache_write.input_tokens` | cached tokens, when not `0` |
+| `error.type` | see [Errors](#errors) |
+
+</details>
+
+<details>
+<summary>Metrics</summary>
+
+| Metric | Type |
+|---|---|
+| `gen_ai.client.inference.duration` | histogram, seconds |
+| `gen_ai.client.inference.time_to_first_chunk` | histogram, seconds (streams) |
+| `gen_ai.client.inference.time_per_output_chunk` | histogram, seconds (streams) |
+| `gen_ai.client.inference.operation.input_tokens`, `.output_tokens` | histograms, tokens |
+| `gen_ai.client.inference.usage.input_tokens`, `.output_tokens`, `.cache_read.input_tokens`, `.cache_write.input_tokens` | counters, tokens |
+| `gen_ai.execute_tool.duration` | histogram, seconds (`ToolTracer`) |
+
+- Chat metrics have the operation, provider, model and endpoint. Durations and token histograms also have `error.type` when a call fails.
+- The tool metric has the tool name and type, and `error.type` when the tool fails.
+
+</details>
+
+<details>
+<summary>Details and edge cases</summary>
+
+- Durations include request signing, retries and the waits between them.
+- Streams are timed as you read them, so a slow reader makes durations longer.
+- Add one `BedrockInterceptor` per client. If you add more, each call is still recorded once.
+- Captured values are JSON strings that follow the GenAI message schemas. Tools that Bedrock runs itself are recorded as `server_tool_call` parts.
+- Cut JSON values are recorded as strings.
+- Tool results are recorded as `gen_ai.tool.call.result`. JSON results stay objects; plain text is recorded as a string.
+
+</details>
 
 ## Compatibility
 
 | `aws-bedrock-otel` | `opentelemetry` | GenAI semantic conventions |
 |---|---|---|
-| 0.3 | 0.33 | [`semantic-conventions-genai@9ffc7e0`](https://github.com/open-telemetry/semantic-conventions-genai/tree/9ffc7e00c639be7712e544e3e54331e885dccf84) (2026-10-21) |
+| 0.3 | 0.33 | [`9ffc7e0`](https://github.com/open-telemetry/semantic-conventions-genai/tree/9ffc7e00c639be7712e544e3e54331e885dccf84) (2026-10-21) |
 | 0.1, 0.2 | 0.33 | |
 
-Use the same `opentelemetry` version as your app. Each version has its own global providers, so with another version nothing is recorded. A new `opentelemetry` version needs a new minor release of this crate.
+- Use the same `opentelemetry` version as your app. With a different version, nothing is recorded.
+- The GenAI conventions are still changing. Name changes come in minor releases and are listed in the [CHANGELOG](CHANGELOG.md).
 
-The GenAI semantic conventions are in development, so attribute and metric names can still change. Changes come in minor releases and are listed in the [CHANGELOG](CHANGELOG.md).
+## Example
 
-## Examples
-
-[`examples/stdout.rs`](examples/stdout.rs) sends one `Converse` request and prints the span and metrics to your terminal. It needs AWS credentials and access to the model:
+[`examples/stdout.rs`](examples/stdout.rs) sends one request and prints the span and metrics. It needs AWS credentials:
 
 ```sh
 BEDROCK_MODEL_ID=amazon.nova-lite-v1:0 cargo run --example stdout
@@ -157,8 +192,8 @@ BEDROCK_MODEL_ID=amazon.nova-lite-v1:0 cargo run --example stdout
 
 ## Minimum supported Rust version
 
-Rust 1.94.1, the same as the AWS SDK for Rust
+Rust 1.94.1, the same as the AWS SDK for Rust.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE)
+[Apache License, Version 2.0](LICENSE)
